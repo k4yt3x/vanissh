@@ -1,4 +1,10 @@
-project('vanissh', 'cpp', version: '1.0.0', default_options: ['cpp_std=c++23'])
+project(
+  'vanissh',
+  'cpp',
+  version: '1.0.0',
+  meson_version: '>1.1',
+  default_options: ['cpp_std=c++23'],
+)
 
 # Options
 native_opt = get_option('enable_native')
