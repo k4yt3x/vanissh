@@ -1,12 +1,18 @@
 bindir := "build"
-generator := "Ninja"
-cxx := "clang++"
 
 build:
-    cmake -G '{{generator}}' -S . -B '{{bindir}}' \
-        -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-        -DCMAKE_CXX_COMPILER='{{cxx}}' \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DVANISSH_ENABLE_NATIVE=ON \
-        -DVANISSH_ENABLE_FAST_MATH=ON
-    cmake --build '{{bindir}}' --config Release --parallel
+    CXX=clang++ meson setup '{{bindir}}' --reconfigure \
+        --buildtype=release \
+        -Denable_native=true \
+        -Denable_fast_math=true
+    meson compile -C '{{bindir}}'
+
+debug:
+    CXX=clang++ meson setup '{{bindir}}' --reconfigure \
+        --buildtype=debug \
+        -Denable_native=false \
+        -Denable_fast_math=false
+    meson compile -C '{{bindir}}'
+
+clean:
+    rm -rf '{{bindir}}'

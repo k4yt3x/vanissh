@@ -42,8 +42,7 @@ Examples:
 The following dependencies are required to build this project:
 
 - C++23 compatible compiler
-- CMake 3.10 or later
-- OpenSSL development libraries
+- Meson 1.1 or later
 - libssh development libraries
 - just (optional)
 - Ninja (optional)
@@ -51,20 +50,20 @@ The following dependencies are required to build this project:
 Arch Linux:
 
 ```bash
-sudo pacman -Syu base-devel cmake openssl libssh clang ninja just
+sudo pacman -Syu base-devel meson libssh clang ninja just
 ```
 
 Debian/Ubuntu:
 
 ```bash
 sudo apt update
-sudo apt install cmake libssl-dev libssh-dev clang ninja-build just
+sudo apt install meson libssh-dev clang ninja-build just
 ```
 
 Red Hat/Fedora:
 
 ```bash
-sudo dnf install cmake openssl-devel libssh-devel clang ninja-build just
+sudo dnf install meson libssh-devel clang ninja-build just
 ```
 
 ### Compile
@@ -75,14 +74,14 @@ If Clang, Ninja, and just are installed, you can simply run:
 just
 ```
 
-Alternatively, you can use CMake directly:
+Alternatively, you can use Meson directly:
 
 ```bash
-cmake -S . -B build \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DVANISSH_ENABLE_NATIVE=ON \
-    -DVANISSH_ENABLE_FAST_MATH=ON
-cmake --build build --config Release --parallel
+CXX=clang++ meson setup build --reconfigure \
+    --buildtype=release \
+    -Denable_native=true \
+    -Denable_fast_math=true
+meson compile -C build
 ```
 
 The compiled binary will be located at `build/vanissh`.
