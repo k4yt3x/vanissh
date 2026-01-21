@@ -17,6 +17,7 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
+#include <openssl/sha.h>
 
 #include <libssh/libssh.h>
 
@@ -90,6 +91,48 @@ std::string SSHKeyGenerator::get_private_key_openssh() const {
         cached_private_key_openssh_ = private_key_to_openssh();
     }
     return cached_private_key_openssh_;
+}
+
+std::string SSHKeyGenerator::get_public_key_fingerprint() const {
+    if (!cached_public_key_fingerprint_.empty()) {
+        return cached_public_key_fingerprint_;
+    }
+
+    // Get the SSH public key
+    const std::string& ssh_key = get_public_key_ssh();
+    if (ssh_key.empty()) {
+        return "";
+    }
+
+    // Extract the base64 part (second field after space)
+    size_t space_pos = ssh_key.find(' ');
+    if (space_pos == std::string::npos) {
+        return "";
+    }
+
+    std::string base64_part = ssh_key.substr(space_pos + 1);
+
+    // Decode the base64 data
+    std::vector<unsigned char> decoded = Base64Encoder::decode_data(base64_part);
+    if (decoded.empty()) {
+        return "";
+    }
+
+    // Compute SHA256 hash
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(decoded.data(), decoded.size(), hash);
+
+    // Encode hash as base64
+    std::string fingerprint = Base64Encoder::encode_data(hash, SHA256_DIGEST_LENGTH);
+
+    // Remove padding characters
+    fingerprint.erase(
+        std::remove(fingerprint.begin(), fingerprint.end(), '='),
+        fingerprint.end()
+    );
+
+    cached_public_key_fingerprint_ = fingerprint;
+    return cached_public_key_fingerprint_;
 }
 
 std::string SSHKeyGenerator::public_key_to_ssh() const {
@@ -232,40 +275,25 @@ std::string SSHKeyGenerator::private_key_to_openssh() const {
     return result;
 }
 
-bool SSHKeyGenerator::matches_vanity(
+bool SSHKeyGenerator::matches_pattern(
+    const std::string& base64_str,
+    size_t prefix_offset,
     const std::string& prefix,
     const std::string& suffix,
     const std::string& contains,
     bool case_insensitive
 ) const {
-    // Fast path: generate SSH key string only once and reuse
-    if (!cache_valid_) [[unlikely]] {
-        cached_public_key_ssh_ = public_key_to_ssh();
-        cache_valid_ = true;
-    }
-
-    const std::string& ssh_key = cached_public_key_ssh_;
-    if (ssh_key.empty()) [[unlikely]] {
-        return false;
-    }
-
-    // Extract base64 part and skip algorithm prefix
-    size_t space_pos = ssh_key.find(' ');
-    if (space_pos == std::string::npos) [[unlikely]] {
-        return false;
-    }
-
-    const char* base64_start = ssh_key.c_str() + space_pos + 1;
-    size_t base64_len = ssh_key.length() - space_pos - 1;
+    const char* base64_start = base64_str.c_str();
+    size_t base64_len = base64_str.length();
 
     // Check if the prefix matches
     if (!prefix.empty()) [[likely]] {
-        // Skip the fixed "AAAAC3NzaC1lZDI1NTE5AAAAI" prefix
-        if (base64_len < kEd25519WireFormatPrefixLen + prefix.length()) [[unlikely]] {
+        // Skip the prefix offset (for public key, skip the fixed Ed25519 wire format prefix)
+        if (base64_len < prefix_offset + prefix.length()) [[unlikely]] {
             return false;
         }
 
-        const char* variable_part = base64_start + kEd25519WireFormatPrefixLen;
+        const char* variable_part = base64_start + prefix_offset;
 
         if (case_insensitive) [[unlikely]] {
             for (size_t i = 0; i < prefix.length(); ++i) {
@@ -342,10 +370,66 @@ bool SSHKeyGenerator::matches_vanity(
     return true;
 }
 
+bool SSHKeyGenerator::matches_vanity(
+    const std::string& prefix,
+    const std::string& suffix,
+    const std::string& contains,
+    bool case_insensitive,
+    bool use_fingerprint
+) const {
+    if (use_fingerprint) {
+        // Use fingerprint
+        const std::string& fingerprint = get_public_key_fingerprint();
+        if (fingerprint.empty()) [[unlikely]] {
+            return false;
+        }
+
+        // For fingerprint, no offset needed - match from the start
+        return matches_pattern(
+            fingerprint,
+            0,
+            prefix,
+            suffix,
+            contains,
+            case_insensitive
+        );
+    } else {
+        // Fast path: generate SSH key string only once and reuse
+        if (!cache_valid_) [[unlikely]] {
+            cached_public_key_ssh_ = get_public_key_ssh();
+            cache_valid_ = true;
+        }
+
+        const std::string& ssh_key = cached_public_key_ssh_;
+        if (ssh_key.empty()) [[unlikely]] {
+            return false;
+        }
+
+        // Extract base64 part and skip algorithm prefix
+        size_t space_pos = ssh_key.find(' ');
+        if (space_pos == std::string::npos) [[unlikely]] {
+            return false;
+        }
+
+        std::string base64_part = ssh_key.substr(space_pos + 1);
+
+        // For public key, skip the fixed "AAAAC3NzaC1lZDI1NTE5AAAAI" prefix
+        return matches_pattern(
+            base64_part,
+            kEd25519WireFormatPrefixLen,
+            prefix,
+            suffix,
+            contains,
+            case_insensitive
+        );
+    }
+}
+
 void SSHKeyGenerator::clear_cache() {
     cached_public_key_ssh_.clear();
     cached_private_key_pem_.clear();
     cached_private_key_openssh_.clear();
+    cached_public_key_fingerprint_.clear();
     cache_valid_ = false;
 }
 
@@ -355,6 +439,7 @@ VanityResult SSHKeyGenerator::generate_vanity_key(
     const std::string& contains,
     int num_threads,
     bool case_insensitive,
+    bool use_fingerprint,
     std::atomic<bool>* stop_flag,
     std::atomic<uint64_t>* total_attempts
 ) {
@@ -400,6 +485,7 @@ VanityResult SSHKeyGenerator::generate_vanity_key(
                 suffix,
                 contains,
                 case_insensitive,
+                use_fingerprint,
                 &found,
                 stop_flag,
                 total_attempts,
@@ -421,6 +507,7 @@ void SSHKeyGenerator::worker_thread(
     const std::string& suffix,
     const std::string& contains,
     bool case_insensitive,
+    bool use_fingerprint,
     std::atomic<bool>* found,
     std::atomic<bool>* stop_flag,
     std::atomic<uint64_t>* total_attempts,
@@ -469,7 +556,7 @@ void SSHKeyGenerator::worker_thread(
 
         // Fast path: do direct pattern matching without expensive string operations
         if (generator.matches_vanity(
-                search_prefix, search_suffix, search_contains, case_insensitive
+                search_prefix, search_suffix, search_contains, case_insensitive, use_fingerprint
             )) [[unlikely]] {
             bool expected = false;
             if (found->compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
@@ -477,6 +564,7 @@ void SSHKeyGenerator::worker_thread(
                 result->private_key_pem = generator.get_private_key_pem();
                 result->private_key_openssh = generator.get_private_key_openssh();
                 result->public_key_ssh = generator.get_public_key_ssh();
+                result->public_key_fingerprint = generator.get_public_key_fingerprint();
             }
             break;
         }

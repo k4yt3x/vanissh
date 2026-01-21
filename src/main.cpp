@@ -45,16 +45,20 @@ void print_usage() {
         "  -j, --threads NUM      Number of threads to use (default: auto)\n"
         "  -o, --output FILE      Output private key to file (default: stdout)\n"
         "  -i, --ignore-case      Case-insensitive matching\n"
+        "  -f, --fingerprint      Match against SHA256 fingerprint instead of public key\n"
         "  -h, --help             Show this help message\n\n"
         "Notes:\n"
         "  - At least one of --prefix, --suffix, or --contains must be specified.\n"
         "  - Ed25519 public keys will always start with 'AAAAC3NzaC1lZDI1NTE5AAAAI',\n"
-        "      which will be skipped when matching prefixes.\n"
-        "  - The prefixes have a limited character set; not all characters are possible.\n\n"
+        "      which will be skipped when matching prefixes (unless --fingerprint is used).\n"
+        "  - The prefixes have a limited character set; not all characters are possible.\n"
+        "  - When using --fingerprint, matches are done against the base64-encoded SHA256\n"
+        "      fingerprint instead of the public key.\n\n"
         "Examples:\n"
         "  vanissh -s TEST\n"
         "  vanissh -c 1337 -i\n"
         "  vanissh -p abc -i -o id_ed25519\n"
+        "  vanissh -p AAAA -f\n"
     );
 }
 
@@ -96,6 +100,7 @@ int main(int argc, char* argv[]) {
     std::string output_file;
     int num_threads = 0;
     bool case_insensitive = false;
+    bool use_fingerprint = false;
 
     static struct option long_options[] = {
         {"prefix", required_argument, nullptr, 'p'},
@@ -104,6 +109,7 @@ int main(int argc, char* argv[]) {
         {"threads", required_argument, nullptr, 'j'},
         {"output", required_argument, nullptr, 'o'},
         {"ignore-case", no_argument, nullptr, 'i'},
+        {"fingerprint", no_argument, nullptr, 'f'},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
@@ -111,7 +117,7 @@ int main(int argc, char* argv[]) {
     int option_index = 0;
     int c;
 
-    while ((c = getopt_long(argc, argv, "p:s:c:j:o:ih", long_options, &option_index)) != -1) {
+    while ((c = getopt_long(argc, argv, "p:s:c:j:o:ifh", long_options, &option_index)) != -1) {
         switch (c) {
             case 'p':
                 prefix = optarg;
@@ -134,6 +140,9 @@ int main(int argc, char* argv[]) {
                 break;
             case 'i':
                 case_insensitive = true;
+                break;
+            case 'f':
+                use_fingerprint = true;
                 break;
             case 'h':
                 print_usage();
@@ -196,6 +205,9 @@ int main(int argc, char* argv[]) {
     if (case_insensitive) {
         std::println("Case-insensitive: yes");
     }
+    if (use_fingerprint) {
+        std::println("Match target: SHA256 fingerprint");
+    }
     std::println("Threads: {}", (num_threads > 0 ? std::to_string(num_threads) : "auto"));
     if (!output_file.empty()) {
         std::println("Output: {}", output_file);
@@ -210,7 +222,7 @@ int main(int argc, char* argv[]) {
 
     // Generate vanity SSH key
     VanityResult result = SSHKeyGenerator::generate_vanity_key(
-        prefix, suffix, contains, num_threads, case_insensitive, &g_stop_flag, &g_total_attempts
+        prefix, suffix, contains, num_threads, case_insensitive, use_fingerprint, &g_stop_flag, &g_total_attempts
     );
 
     auto end_time = std::chrono::steady_clock::now();
@@ -245,6 +257,10 @@ int main(int argc, char* argv[]) {
 
     std::println("Public key:");
     std::println("{}", result.public_key_ssh);
+    std::println();
+
+    std::println("Public key fingerprint (SHA256):");
+    std::println("SHA256:{}", result.public_key_fingerprint);
     std::println();
 
     // Output private key
