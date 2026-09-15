@@ -25,8 +25,12 @@ debug:
 test:
     meson test -C '{{bindir}}' --print-errorlogs
 
+# Slow end-to-end tests of every pattern combination on every backend
+test-extended:
+    meson test -C '{{bindir}}' --print-errorlogs --setup full --suite extended
+
 format:
-    clang-format -i src/*.cpp src/*.h src/cuda/*.cpp src/cuda/*.h src/cuda/*.cu src/cuda/*.cuh tests/*.cu
+    clang-format -i src/*.cpp src/*.h src/cuda/*.cpp src/cuda/*.h src/cuda/*.cu src/cuda/*.cuh tests/*.cu tests/*.cpp tests/*.h
 
 clean:
     rm -rf '{{bindir}}'

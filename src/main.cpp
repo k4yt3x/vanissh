@@ -1,4 +1,5 @@
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -14,6 +15,7 @@
 #include <system_error>
 #include <thread>
 #include <tuple>
+#include <utility>
 
 #include <fcntl.h>
 #include <getopt.h>
@@ -36,9 +38,12 @@ constexpr std::string_view kVersion = VANISSH_VERSION;
 constexpr std::string_view kBase64Chars =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 constexpr int64_t kProgressRefreshIntervalSec = 1;
-// Length of the base64 form of an ssh-ed25519 public key, and of its constant prefix
-constexpr size_t kKeyBase64Length = 68;
-constexpr size_t kFixedPrefixLength = 25;
+// The first variable character of a key shares a base64 group with the
+// constant key length byte, so only its low four bits vary
+constexpr std::string_view kKeyFirstChars = "ABCDEFGHIJKLMNOP";
+// The last fingerprint character encodes the final four digest bits followed
+// by two zero bits
+constexpr std::string_view kFingerprintLastChars = "AEIMQUYcgkosw048";
 #ifdef VANISSH_CUDA
 constexpr size_t kGpuSelfTestKeys = 4096;
 #endif
@@ -48,7 +53,7 @@ std::atomic<bool> g_stop_flag(false);
 std::atomic<uint64_t> g_total_attempts(0);
 
 struct Options {
-    VanityPattern pattern;
+    VanityCriteria criteria;
     std::string output_file;
     int num_threads = 0;
     bool use_gpu = false;
@@ -72,32 +77,50 @@ void signal_handler(int /*signal*/) {
 void print_usage() {
     std::print(
         "Usage: vanissh [OPTIONS]\n\n"
-        "Generate vanity SSH public keys that start/end with specified strings.\n\n"
+        "Generate Ed25519 SSH keys whose public key or SHA-256 fingerprint starts with,\n"
+        "ends with, or contains the strings you choose.\n\n"
         "Options:\n"
-        "  -p, --prefix PREFIX    Desired prefix for the base64 public key\n"
-        "  -s, --suffix SUFFIX    Desired suffix for the base64 public key\n"
-        "  -c, --contains STRING  String that must appear anywhere in the base64 public key\n"
-        "  -j, --threads NUM      Number of threads to use (default: auto)\n"
+        "  -p, --prefix PREFIX                Desired prefix of the base64 public key\n"
+        "  -s, --suffix SUFFIX                Desired suffix of the base64 public key\n"
+        "  -c, --contains STRING              String that must appear anywhere in the\n"
+        "                                       base64 public key\n"
+        "  -P, --fingerprint-prefix PREFIX    Desired prefix of the SHA-256 fingerprint\n"
+        "  -S, --fingerprint-suffix SUFFIX    Desired suffix of the SHA-256 fingerprint\n"
+        "  -C, --fingerprint-contains STRING  String that must appear anywhere in the\n"
+        "                                       SHA-256 fingerprint\n"
+        "  -j, --threads NUM                  Number of threads to use (default: auto)\n"
 #ifdef VANISSH_CUDA
-        "  -g, --gpu              Search on the GPU with CUDA instead of the CPU\n"
-        "  -d, --device NUM       CUDA device index to use; implies --gpu (default: 0)\n"
+        "  -g, --gpu                          Search on the GPU with CUDA instead of the CPU\n"
+        "  -d, --device NUM                   CUDA device index to use; implies --gpu\n"
+        "                                       (default: 0)\n"
 #endif
-        "  -o, --output FILE      Output private key to file (default: stdout)\n"
-        "  -i, --ignore-case      Case-insensitive matching\n"
-        "  -h, --help             Show this help message\n\n"
+        "  -o, --output FILE                  Output private key to file (default: stdout)\n"
+        "  -i, --ignore-case                  Case-insensitive matching\n"
+        "  -h, --help                         Show this help message\n\n"
         "Notes:\n"
-        "  - At least one of --prefix, --suffix, or --contains must be specified.\n"
-        "  - Ed25519 public keys will always start with 'AAAAC3NzaC1lZDI1NTE5AAAAI',\n"
-        "      which will be skipped when matching prefixes.\n"
-        "  - The first character after that prefix is always one of A-P.\n\n"
+        "  - At least one pattern must be specified; all given patterns must match.\n"
+        "  - Ed25519 public keys always start with 'AAAAC3NzaC1lZDI1NTE5AAAAI', which is\n"
+        "      skipped when matching prefixes. The character after it is one of A-P.\n"
+        "  - Fingerprint patterns apply to the 43 characters after 'SHA256:', the last\n"
+        "      of which is one of A E I M Q U Y c g k o s w 0 4 8.\n\n"
         "Examples:\n"
         "  vanissh -s TEST\n"
         "  vanissh -c 1337 -i\n"
         "  vanissh -p abc -i -o id_ed25519\n"
+        "  vanissh -S cafe -i\n"
 #ifdef VANISSH_CUDA
         "  vanissh -g -s TEST -o id_ed25519\n"
 #endif
     );
+}
+
+// Fingerprints are usually pasted as "SHA256:<base64>"; the constant part is
+// not part of the matched string
+std::string without_fingerprint_prefix(std::string_view pattern) {
+    if (pattern.starts_with(kFingerprintSha256Prefix)) {
+        pattern.remove_prefix(kFingerprintSha256Prefix.size());
+    }
+    return std::string(pattern);
 }
 
 std::optional<int> parse_int(std::string_view text) {
@@ -115,6 +138,9 @@ bool parse_options(int argc, char* argv[], Options& options, int& exit_code) {
         {"prefix", required_argument, nullptr, 'p'},
         {"suffix", required_argument, nullptr, 's'},
         {"contains", required_argument, nullptr, 'c'},
+        {"fingerprint-prefix", required_argument, nullptr, 'P'},
+        {"fingerprint-suffix", required_argument, nullptr, 'S'},
+        {"fingerprint-contains", required_argument, nullptr, 'C'},
         {"threads", required_argument, nullptr, 'j'},
         {"gpu", no_argument, nullptr, 'g'},
         {"device", required_argument, nullptr, 'd'},
@@ -126,16 +152,25 @@ bool parse_options(int argc, char* argv[], Options& options, int& exit_code) {
 
     exit_code = 1;
     int c = 0;
-    while ((c = getopt_long(argc, argv, "p:s:c:j:gd:o:ih", long_options, nullptr)) != -1) {
+    while ((c = getopt_long(argc, argv, "p:s:c:P:S:C:j:gd:o:ih", long_options, nullptr)) != -1) {
         switch (c) {
             case 'p':
-                options.pattern.prefix = optarg;
+                options.criteria.key.prefix = optarg;
                 break;
             case 's':
-                options.pattern.suffix = optarg;
+                options.criteria.key.suffix = optarg;
                 break;
             case 'c':
-                options.pattern.contains = optarg;
+                options.criteria.key.contains = optarg;
+                break;
+            case 'P':
+                options.criteria.fingerprint.prefix = without_fingerprint_prefix(optarg);
+                break;
+            case 'S':
+                options.criteria.fingerprint.suffix = without_fingerprint_prefix(optarg);
+                break;
+            case 'C':
+                options.criteria.fingerprint.contains = without_fingerprint_prefix(optarg);
                 break;
             case 'j': {
                 const auto threads = parse_int(optarg);
@@ -163,7 +198,7 @@ bool parse_options(int argc, char* argv[], Options& options, int& exit_code) {
                 options.output_file = optarg;
                 break;
             case 'i':
-                options.pattern.case_insensitive = true;
+                options.criteria.case_insensitive = true;
                 break;
             case 'h':
                 print_usage();
@@ -174,50 +209,90 @@ bool parse_options(int argc, char* argv[], Options& options, int& exit_code) {
         }
     }
 
-    if (options.pattern.empty()) {
-        std::println(
-            stderr, "Error: At least one of --prefix, --suffix, or --contains must be specified"
-        );
+    if (options.criteria.empty()) {
+        std::println(stderr, "Error: At least one pattern must be specified");
         print_usage();
         return false;
     }
     return true;
 }
 
-// Returns a message if the pattern is malformed or can never match a key
-std::optional<std::string> validate_pattern(const VanityPattern& pattern) {
+// Whether c, or its other-case form when case_insensitive, is one of chars
+bool can_occur(char c, std::string_view chars, bool case_insensitive) {
+    if (chars.contains(c)) {
+        return true;
+    }
+    if (!case_insensitive) {
+        return false;
+    }
+    const auto uc = static_cast<unsigned char>(c);
+    const char other = std::isupper(uc) ? static_cast<char>(std::tolower(uc))
+                                        : static_cast<char>(std::toupper(uc));
+    return chars.contains(other);
+}
+
+// Returns a message if a part of the pattern is malformed or too long for its target
+std::optional<std::string>
+validate_pattern(std::string_view name, const VanityPattern& pattern, const VanityTarget& target) {
     const std::tuple<std::string_view, const std::string&, size_t> parts[] = {
-        {"Prefix", pattern.prefix, kKeyBase64Length - kFixedPrefixLength},
-        {"Suffix", pattern.suffix, kKeyBase64Length},
-        {"Contains string", pattern.contains, kKeyBase64Length},
+        {"prefix", pattern.prefix, target.length - target.prefix_offset},
+        {"suffix", pattern.suffix, target.length},
+        {"contains string", pattern.contains, target.length},
     };
-    for (const auto& [name, value, max_length] : parts) {
+    for (const auto& [part, value, max_length] : parts) {
         for (const char c : value) {
             if (!kBase64Chars.contains(c)) {
                 return std::format(
-                    "{} contains invalid base64 character: '{}'\nValid characters: {}",
+                    "{} {} contains invalid base64 character: '{}'\nValid characters: {}",
                     name,
+                    part,
                     c,
                     kBase64Chars
                 );
             }
         }
         if (value.size() > max_length) {
-            return std::format("{} is longer than {} characters", name, max_length);
+            return std::format("{} {} is longer than {} characters", name, part, max_length);
         }
     }
+    return std::nullopt;
+}
 
-    // The first variable character shares a base64 group with the constant key
-    // length byte, so only its low four bits vary: 'A' to 'P'.
-    if (!pattern.prefix.empty()) {
-        const char first = pattern.prefix.front();
-        const bool possible = (first >= 'A' && first <= 'P') ||
-                              (pattern.case_insensitive && first >= 'a' && first <= 'p');
-        if (!possible) {
+// Returns a message if the criteria are malformed or can never match a key
+std::optional<std::string> validate_criteria(const VanityCriteria& criteria) {
+    if (auto error = validate_pattern("Public key", criteria.key, kKeyTarget)) {
+        return error;
+    }
+    if (auto error = validate_pattern("Fingerprint", criteria.fingerprint, kFingerprintTarget)) {
+        return error;
+    }
+
+    const bool case_insensitive = criteria.case_insensitive;
+    if (!criteria.key.prefix.empty() &&
+        !can_occur(criteria.key.prefix.front(), kKeyFirstChars, case_insensitive)) {
+        return std::format(
+            "Public key prefix cannot start with '{}': the first character after the fixed "
+            "prefix is always one of A-P",
+            criteria.key.prefix.front()
+        );
+    }
+
+    // A suffix, or a contains string as long as the fingerprint, ends on the
+    // last fingerprint character
+    const VanityPattern& fingerprint = criteria.fingerprint;
+    const bool contains_all = fingerprint.contains.size() == kFingerprintTarget.length;
+    const std::pair<std::string_view, std::string_view> ends[] = {
+        {"suffix", fingerprint.suffix},
+        {"contains string", contains_all ? std::string_view(fingerprint.contains) : ""},
+    };
+    for (const auto& [part, value] : ends) {
+        if (!value.empty() && !can_occur(value.back(), kFingerprintLastChars, case_insensitive)) {
             return std::format(
-                "Prefix cannot start with '{}': the first character after the fixed prefix is "
-                "always one of A-P",
-                first
+                "Fingerprint {} cannot end with '{}': the last fingerprint character is always "
+                "one of {}",
+                part,
+                value.back(),
+                kFingerprintLastChars
             );
         }
     }
@@ -291,7 +366,7 @@ int main(int argc, char* argv[]) {
         return exit_code;
     }
 
-    if (const auto error = validate_pattern(options.pattern)) {
+    if (const auto error = validate_criteria(options.criteria)) {
         std::println(stderr, "Error: {}", *error);
         return 1;
     }
@@ -324,16 +399,20 @@ int main(int argc, char* argv[]) {
     std::println("VaniSSH Version {}\n", kVersion);
     std::println("Key generation parameters:");
     std::println("==========================");
-    if (!options.pattern.prefix.empty()) {
-        std::println("Prefix: {}", options.pattern.prefix);
+    const std::tuple<std::string_view, std::string_view, const std::string&> patterns[] = {
+        {"Public key", "prefix", options.criteria.key.prefix},
+        {"Public key", "suffix", options.criteria.key.suffix},
+        {"Public key", "contains", options.criteria.key.contains},
+        {"Fingerprint", "prefix", options.criteria.fingerprint.prefix},
+        {"Fingerprint", "suffix", options.criteria.fingerprint.suffix},
+        {"Fingerprint", "contains", options.criteria.fingerprint.contains},
+    };
+    for (const auto& [target, part, value] : patterns) {
+        if (!value.empty()) {
+            std::println("{} {}: {}", target, part, value);
+        }
     }
-    if (!options.pattern.suffix.empty()) {
-        std::println("Suffix: {}", options.pattern.suffix);
-    }
-    if (!options.pattern.contains.empty()) {
-        std::println("Contains: {}", options.pattern.contains);
-    }
-    if (options.pattern.case_insensitive) {
+    if (options.criteria.case_insensitive) {
         std::println("Case-insensitive: yes");
     }
 #ifdef VANISSH_CUDA
@@ -361,12 +440,12 @@ int main(int argc, char* argv[]) {
     try {
 #ifdef VANISSH_CUDA
         if (gpu) {
-            result = gpu->generate(options.pattern, &g_stop_flag, &g_total_attempts);
+            result = gpu->generate(options.criteria, &g_stop_flag, &g_total_attempts);
         } else
 #endif
         {
             result = SSHKeyGenerator::generate_vanity_key(
-                options.pattern, options.num_threads, &g_stop_flag, &g_total_attempts
+                options.criteria, options.num_threads, &g_stop_flag, &g_total_attempts
             );
         }
     } catch (const std::exception& e) {
@@ -410,6 +489,10 @@ int main(int argc, char* argv[]) {
 
     std::println("Public key:");
     std::println("{}", result.public_key_ssh);
+    std::println();
+
+    std::println("Fingerprint:");
+    std::println("{}", result.fingerprint_sha256);
     std::println();
 
     if (!options.output_file.empty()) {

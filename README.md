@@ -3,80 +3,87 @@
 > [!WARNING]
 > VaniSSH generates keys with OpenSSL, but it has not been independently audited. Other vanity key generators have shipped serious vulnerabilities before, such as [Profanity](https://blog.1inch.io/a-vulnerability-disclosed-in-profanity-an-ethereum-vanity-address-tool/). Understand the risks before using a vanity key for anything important.
 
-VaniSSH generates Ed25519 SSH keys whose public key starts with, ends with, or contains a string of your choice. It keeps generating random keys until one matches, so the result is an ordinary, fully random key that just happens to look the way you want.
+VaniSSH generates Ed25519 SSH keys whose public key or SHA-256 fingerprint starts with, ends with, or contains strings of your choice. It generates random keys until one matches, so the result is an ordinary key that happens to look the way you want.
 
 <img width="1058" height="808" alt="VaniSSH screenshot" src="https://github.com/user-attachments/assets/0ae27b70-0f3f-411b-853b-8bb801bcc40c" />
 
 ## Features
 
-- **Prefix, suffix and substring matching**, case-sensitive or not, in any combination.
+- **Prefix, suffix and substring matching** on the public key, on its SHA-256 fingerprint, or on both at once, case-sensitive or not.
 - **CPU backend** built on OpenSSL, using every core.
-- **CUDA backend** that runs the whole key derivation on the GPU: about 250 million keys per second on an NVIDIA RTX A6000, roughly 500 times a 16-core Ryzen 9 5950X.
+- **CUDA backend** that runs the whole key derivation on the GPU: about 250 million keys per second on an RTX A6000, roughly 500 times a Ryzen 9 5950X.
 - **Verified results**: every key found on the GPU is re-derived with OpenSSL before it is accepted.
-- **OpenSSH key format** output, written with owner-only permissions and ready for `~/.ssh`.
+- **OpenSSH key format** output with owner-only permissions, ready for `~/.ssh`.
 
 ## Installation
 
-Download the Linux x86-64 binary from [GitHub Releases](https://github.com/k4yt3x/vanissh/releases/latest) and put `vanissh` somewhere on your `PATH`. It runs on any distribution with glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later) and includes the GPU backend, which needs an NVIDIA driver supporting CUDA 13 (R580 or newer) when `-g` is used. Other platforms and older systems can build from source, see [Building](#building).
+Download the Linux x86-64 binary from [GitHub Releases](https://github.com/k4yt3x/vanissh/releases/latest) and put `vanissh` on your `PATH`. It needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later); the GPU backend needs an NVIDIA driver with CUDA 13 support (R580 or newer). Other platforms can build from source, see [Building](#building).
 
 ## Usage
 
 ```console
 Usage: vanissh [OPTIONS]
 
-Generate vanity SSH public keys that start/end with specified strings.
+Generate Ed25519 SSH keys whose public key or SHA-256 fingerprint starts with,
+ends with, or contains the strings you choose.
 
 Options:
-  -p, --prefix PREFIX    Desired prefix for the base64 public key
-  -s, --suffix SUFFIX    Desired suffix for the base64 public key
-  -c, --contains STRING  String that must appear anywhere in the base64 public key
-  -j, --threads NUM      Number of threads to use (default: auto)
-  -g, --gpu              Search on the GPU with CUDA instead of the CPU
-  -d, --device NUM       CUDA device index to use; implies --gpu (default: 0)
-  -o, --output FILE      Output private key to file (default: stdout)
-  -i, --ignore-case      Case-insensitive matching
-  -h, --help             Show this help message
+  -p, --prefix PREFIX                Desired prefix of the base64 public key
+  -s, --suffix SUFFIX                Desired suffix of the base64 public key
+  -c, --contains STRING              String that must appear anywhere in the
+                                       base64 public key
+  -P, --fingerprint-prefix PREFIX    Desired prefix of the SHA-256 fingerprint
+  -S, --fingerprint-suffix SUFFIX    Desired suffix of the SHA-256 fingerprint
+  -C, --fingerprint-contains STRING  String that must appear anywhere in the
+                                       SHA-256 fingerprint
+  -j, --threads NUM                  Number of threads to use (default: auto)
+  -g, --gpu                          Search on the GPU with CUDA instead of the CPU
+  -d, --device NUM                   CUDA device index to use; implies --gpu
+                                       (default: 0)
+  -o, --output FILE                  Output private key to file (default: stdout)
+  -i, --ignore-case                  Case-insensitive matching
+  -h, --help                         Show this help message
 
 Notes:
-  - At least one of --prefix, --suffix, or --contains must be specified.
-  - Ed25519 public keys will always start with 'AAAAC3NzaC1lZDI1NTE5AAAAI',
-      which will be skipped when matching prefixes.
-  - The first character after that prefix is always one of A-P.
+  - At least one pattern must be specified; all given patterns must match.
+  - Ed25519 public keys always start with 'AAAAC3NzaC1lZDI1NTE5AAAAI', which is
+      skipped when matching prefixes. The character after it is one of A-P.
+  - Fingerprint patterns apply to the 43 characters after 'SHA256:', the last
+      of which is one of A E I M Q U Y c g k o s w 0 4 8.
 
 Examples:
   vanissh -s TEST
   vanissh -c 1337 -i
   vanissh -p abc -i -o id_ed25519
+  vanissh -S cafe -i
   vanissh -g -s TEST -o id_ed25519
 ```
 
 `-g` and `-d` are only available when VaniSSH was built with CUDA support (see [Building](#building)).
 
-### What can be matched
-
-A public key line looks like this:
-
-```
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIYMqZbWhipIEuqToLPmHzM2y9YXd0YV3H8sZLO8TEST
-            └──────── fixed ────────┘└─────────────── variable ────────────────┘
-```
-
-The first 25 characters encode the key type and length and are the same for every Ed25519 key, so `--prefix` matches what comes right after them. The first variable character can only be `A` to `P`, because it shares a base64 group with the constant key-length byte; VaniSSH rejects prefixes that can never occur. `--suffix` and `--contains` apply to the whole 68-character string. Patterns may only use base64 characters (`A-Z`, `a-z`, `0-9`, `+`, `/`).
-
 ### Examples
 
 ```bash
 vanissh -s TEST                   # public key ends with "TEST"
-vanissh -c cafe -i                # contains "cafe" in any combination of cases
-vanissh -p abc -i -o id_ed25519   # starts with "abc" in any case, private key saved to id_ed25519
-vanissh -g -s TEST -o id_ed25519  # the same search on the GPU
+vanissh -c cafe -i                # public key contains "cafe" in any case
+vanissh -p abc -i -o id_ed25519   # public key starts with "abc", private key saved to id_ed25519
+vanissh -S cafe -i                # fingerprint ends with "cafe" in any case
+vanissh -P k4y -i -c 1337         # fingerprint starts with "k4y" and the public key contains "1337"
+vanissh -g -s TEST -o id_ed25519  # the first search, on the GPU
 ```
 
-The private key is printed to stdout unless `--output` is given, in which case the file is created with mode 0600; an existing file is never overwritten. The public key is always printed, and can also be recovered from the private key with `ssh-keygen -y -f id_ed25519`.
+The private key goes to stdout unless `--output` is given; the file is created with mode 0600 and never overwritten. The public key and its fingerprint are always printed.
+
+### Matching rules
+
+- Patterns use base64 characters only: `A-Z`, `a-z`, `0-9`, `+` and `/`.
+- Every Ed25519 public key starts with `AAAAC3NzaC1lZDI1NTE5AAAAI`. `--prefix` matches what follows, and the first character after it is always one of `A-P`.
+- Fingerprint patterns apply to the 43 characters after `SHA256:`. The last character is always one of `A E I M Q U Y c g k o s w 0 4 8`. A pasted `SHA256:` prefix is ignored.
+- All given patterns must match the same key. Patterns that can never match are rejected up front.
 
 ## Performance
 
-Every additional character multiplies the expected number of attempts by 64 (or by 32 for a letter matched case-insensitively). Measured rates, searching for a pattern that never matches:
+Every character multiplies the expected number of attempts by 64 (32 for a letter matched case-insensitively), on the public key and the fingerprint alike. Measured rates:
 
 | Backend | Keys per second |
 | --- | --- |
@@ -91,59 +98,26 @@ Expected search times for a case-sensitive pattern of a given length:
 | 5 | 1.1 G | 4 s | 36 min |
 | 6 | 68.7 G | 5 min | 38 h |
 | 7 | 4.4 T | 4.9 h | 102 days |
+| 8 | 281.5 T | 13 days | 17.9 years |
+| 9 | 18.0 P | 2.3 years | 1142.5 years |
 
-Both backends are unaffected by which of `--prefix`, `--suffix` or `--contains` is used.
-
-## How it works
-
-An Ed25519 public key is derived from its 32-byte seed as `SHA-512(seed) → clamp → scalar × base point → encode`, and there is no shortcut: OpenSSH private keys store the seed, not the scalar, so every candidate needs its own hash and scalar multiplication. VaniSSH simply does this as fast as possible.
-
-The CPU backend generates keys with OpenSSL on every core and matches their base64 form. The CUDA backend runs the whole derivation on the GPU:
-
-- field arithmetic mod 2²⁵⁵ − 19 in radix 2^25.5 (ten 32-bit limbs, the ref10/donna layout), built around the GPU's 32×32→64-bit multiply-add;
-- fixed-base scalar multiplication with an 18-bit signed comb window, i.e. 15 point additions per key against a 240 MiB table computed on the device at startup;
-- Montgomery's batch-inversion trick, sharing one field inversion between 32 keys per thread;
-- matching directly on base64 sextets, so no strings are built on the GPU.
+Fingerprint patterns cost about 5% on the GPU and nothing measurable on the CPU. Combined with a public key pattern, the search runs at the public key rate.
 
 ## Security
 
-- **Entropy.** CPU keys come straight from OpenSSL's key generation. GPU keys are derived from a fresh 256-bit base seed drawn from OpenSSL's private CSPRNG for every kernel launch, with a per-candidate counter mixed in; every candidate seed is therefore a uniformly random 256-bit value.
-- **Verification.** The GPU only searches. At startup, 4096 GPU-derived public keys are compared with OpenSSL, and every key the GPU reports is re-derived and re-matched with OpenSSL on the host before it is written out. A bug in the GPU arithmetic can only make the search fail loudly, never produce a wrong key.
-- **Key files** are created with mode 0600 and existing files are never overwritten.
+- **Entropy.** CPU keys come from OpenSSL's key generation. GPU keys are derived from a fresh 256-bit seed drawn from OpenSSL's CSPRNG for every launch, so every candidate is a uniformly random 256-bit value.
+- **Verification.** At startup 4096 GPU-derived keys are compared with OpenSSL, and every key the GPU reports is re-derived and re-matched with OpenSSL before it is written. A GPU bug can only make the search fail, never produce a wrong key.
+- **Key files** are created with mode 0600 and never overwritten.
 
 ## Building
 
-### Prerequisites
-
-- A C++23 compiler (Clang or GCC)
-- Meson 1.1 or later and Ninja
-- OpenSSL development files
-- [just](https://github.com/casey/just) (optional, for the recipes below)
-- CUDA Toolkit 12 or later with `nvcc` on `PATH` (optional, for the GPU backend)
-
-Arch Linux:
+Requires a C++23 compiler, Meson 1.1 or later, Ninja and the OpenSSL development files. CUDA Toolkit 12 or later is optional for the GPU backend, [just](https://github.com/casey/just) for the recipes below.
 
 ```bash
-sudo pacman -Syu base-devel meson openssl clang ninja just
-sudo pacman -S cuda  # optional, GPU backend
+sudo pacman -S base-devel meson openssl clang ninja just cuda        # Arch Linux (cuda optional)
+sudo apt install meson ninja-build pkg-config clang libssl-dev just  # Debian/Ubuntu
+sudo dnf install meson ninja-build pkgconf clang openssl-devel just  # Fedora
 ```
-
-Debian/Ubuntu:
-
-```bash
-sudo apt update
-sudo apt install meson ninja-build pkg-config clang libssl-dev just
-```
-
-Red Hat/Fedora:
-
-```bash
-sudo dnf install meson ninja-build pkgconf clang openssl-devel just
-```
-
-### Compile
-
-With just installed:
 
 ```bash
 just            # release build, GPU backend included when nvcc is found
@@ -154,19 +128,18 @@ just test       # run the tests
 Or with Meson directly:
 
 ```bash
-CXX=clang++ meson setup build --buildtype=release -Denable_native=true
+CXX=clang++ meson setup build --buildtype=release
 meson compile -C build
-meson test -C build
 ```
 
-The binary is `build/vanissh`. The tests generate a key with each available backend and check it with `ssh-keygen`; CUDA builds additionally run unit tests that compare the GPU field arithmetic, SHA-512 and scalar multiplication against OpenSSL on adversarial inputs.
+The binary is `build/vanissh`.
 
 ### Build options
 
-- `-Denable_native=true` (default): compile for the CPU of the build machine (`-march=native`).
-- `-Denable_cuda=auto` (default): build the GPU backend when `nvcc` is found. `disabled` skips it, `enabled` fails if CUDA is unavailable.
-- `-Dgpu_arch=native` (default): value passed to `nvcc -arch`. The default compiles for the GPU in the build machine; use e.g. `sm_86` or `all-major` for a portable binary.
-- `-Dgpu_window=18` (default): window size in bits of the precomputed table (4–20). Each key costs ⌈256 / window⌉ point additions, while the table takes ⌈256 / window⌉ × 2^(window−1) × 128 bytes of GPU memory: 240 MiB at 18, 64 MiB at 16 (about 4% slower). Larger windows were slower on an RTX A6000.
+- `-Denable_native=true` (default): compile for the CPU of the build machine.
+- `-Denable_cuda=auto` (default): build the GPU backend when `nvcc` is found; `disabled` skips it, `enabled` requires it.
+- `-Dgpu_arch=native` (default): value passed to `nvcc -arch`; use `all-major` for a portable binary.
+- `-Dgpu_window=18` (default): size of the precomputed GPU table, 4–20 bits. 18 uses 240 MiB of GPU memory, 16 uses 64 MiB and is about 4% slower.
 
 ## AI use declaration
 

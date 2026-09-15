@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 
 #include "vanity_pattern.h"
 
@@ -15,10 +16,13 @@ struct evp_pkey_ctx_st;
 using EVP_PKEY_CTX = evp_pkey_ctx_st;
 
 inline constexpr size_t kEd25519KeySize = 32;
+// Constant start of an SHA-256 fingerprint, as printed by ssh-keygen -l
+inline constexpr std::string_view kFingerprintSha256Prefix = "SHA256:";
 
 struct VanityResult {
     bool found = false;
     std::string public_key_ssh;
+    std::string fingerprint_sha256;
     std::string private_key_openssh;
     uint64_t attempts = 0;
 };
@@ -43,16 +47,20 @@ class SSHKeyGenerator {
     // Public key as "ssh-ed25519 <base64>"
     [[gnu::hot, nodiscard]] const std::string& get_public_key_ssh() const;
 
+    // Fingerprint of the public key as "SHA256:<unpadded base64>"
+    [[gnu::hot, nodiscard]] const std::string& get_fingerprint_sha256() const;
+
     // Private key in OpenSSH format; empty if the key could not be serialized
     [[nodiscard]] const std::string& get_private_key_openssh() const;
 
-    // Check whether the public key matches the pattern. For case-insensitive
-    // matching the pattern must be lower-cased (VanityPattern::lowercased).
-    [[gnu::hot, nodiscard]] bool matches_vanity(const VanityPattern& pattern) const;
+    // Check whether the public key and its fingerprint match the criteria. For
+    // case-insensitive matching the criteria must be lower-cased
+    // (VanityCriteria::lowercased).
+    [[gnu::hot, nodiscard]] bool matches(const VanityCriteria& criteria) const;
 
     // Multi-threaded vanity search; num_threads <= 0 uses the hardware concurrency
     static VanityResult generate_vanity_key(
-        const VanityPattern& pattern,
+        const VanityCriteria& criteria,
         int num_threads = 0,
         std::atomic<bool>* stop_flag = nullptr,
         std::atomic<uint64_t>* total_attempts = nullptr
@@ -62,17 +70,22 @@ class SSHKeyGenerator {
     EVP_PKEY* private_key_ = nullptr;
     EVP_PKEY_CTX* keygen_ctx_ = nullptr;
     mutable std::string cached_public_key_ssh_;
+    mutable std::string cached_fingerprint_sha256_;
     mutable std::string cached_private_key_openssh_;
 
     // Take ownership of key, replacing the current one
     void reset_key(EVP_PKEY* key);
 
+    // RFC 4253 public key blob: string "ssh-ed25519", string <32 key bytes>;
+    // empty on failure
+    std::string public_key_blob() const;
     std::string public_key_to_ssh() const;
+    std::string fingerprint_to_sha256() const;
     std::string private_key_to_openssh() const;
 
-    // Search loop of one thread; the pattern must already be in matcher form
+    // Search loop of one thread; the criteria must already be in matcher form
     static void worker_thread(
-        const VanityPattern& pattern,
+        const VanityCriteria& criteria,
         std::atomic<bool>* found,
         std::atomic<bool>* stop_flag,
         std::atomic<uint64_t>* total_attempts,

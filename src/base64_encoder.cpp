@@ -37,4 +37,12 @@ std::string encode(std::span<const unsigned char> data) {
     return encoded;
 }
 
+std::string encode_unpadded(std::span<const unsigned char> data) {
+    std::string encoded = encode(data);
+    while (!encoded.empty() && encoded.back() == '=') {
+        encoded.pop_back();
+    }
+    return encoded;
+}
+
 }  // namespace base64

@@ -32,7 +32,7 @@ class CudaBackend {
     [[nodiscard]] std::string config_summary() const;
     [[nodiscard]] uint64_t keys_per_launch(uint32_t batches) const;
 
-    void set_pattern(const VanityPattern& pattern);
+    void set_criteria(const VanityCriteria& criteria);
 
     // Derive the Ed25519 public keys of the given seeds on the GPU
     std::vector<Bytes32> compute_public_keys(const std::vector<Bytes32>& seeds);

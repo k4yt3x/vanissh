@@ -21,7 +21,6 @@
 namespace {
 
 constexpr std::string_view kEd25519AlgorithmName = "ssh-ed25519";
-constexpr std::string_view kEd25519WireFormatPrefix = "AAAAC3NzaC1lZDI1NTE5AAAAI";
 constexpr size_t kPrivateKeyCharsPerLine = 70;
 constexpr std::string_view kOpenSshKeyMagic = "openssh-key-v1";  // followed by a NUL
 constexpr size_t kOpenSshNoneCipherBlockSize = 8;
@@ -49,6 +48,65 @@ std::span<const unsigned char> as_bytes(std::string_view s) {
     return {reinterpret_cast<const unsigned char*>(s.data()), s.size()};
 }
 
+// Checks text against the pattern; for case-insensitive matching the pattern
+// must be lower-cased
+[[gnu::hot]] bool matches_text(
+    std::string_view text,
+    const VanityTarget& target,
+    const VanityPattern& pattern,
+    bool case_insensitive
+) {
+    if (text.size() != target.length) [[unlikely]] {
+        return false;
+    }
+
+    const auto equals = [case_insensitive](std::string_view part, std::string_view wanted) {
+        if (!case_insensitive) {
+            return part == wanted;
+        }
+        for (size_t i = 0; i < wanted.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(part[i])) != wanted[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (!pattern.prefix.empty()) {
+        if (text.size() < target.prefix_offset + pattern.prefix.size()) [[unlikely]] {
+            return false;
+        }
+        if (!equals(text.substr(target.prefix_offset, pattern.prefix.size()), pattern.prefix))
+            [[likely]] {
+            return false;
+        }
+    }
+
+    if (!pattern.suffix.empty()) {
+        if (text.size() < pattern.suffix.size()) [[unlikely]] {
+            return false;
+        }
+        if (!equals(text.substr(text.size() - pattern.suffix.size()), pattern.suffix)) [[likely]] {
+            return false;
+        }
+    }
+
+    if (!pattern.contains.empty()) {
+        if (!case_insensitive) {
+            return text.contains(pattern.contains);
+        }
+        // Reused per thread so the common miss path does not allocate
+        thread_local std::string lowered;
+        lowered.resize(text.size());
+        std::transform(text.begin(), text.end(), lowered.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return lowered.contains(pattern.contains);
+    }
+
+    return true;
+}
+
 }  // namespace
 
 SSHKeyGenerator::~SSHKeyGenerator() {
@@ -60,6 +118,7 @@ void SSHKeyGenerator::reset_key(EVP_PKEY* key) {
     EVP_PKEY_free(private_key_);
     private_key_ = key;
     cached_public_key_ssh_.clear();
+    cached_fingerprint_sha256_.clear();
     cached_private_key_openssh_.clear();
 }
 
@@ -108,6 +167,13 @@ const std::string& SSHKeyGenerator::get_public_key_ssh() const {
     return cached_public_key_ssh_;
 }
 
+const std::string& SSHKeyGenerator::get_fingerprint_sha256() const {
+    if (cached_fingerprint_sha256_.empty()) [[unlikely]] {
+        cached_fingerprint_sha256_ = fingerprint_to_sha256();
+    }
+    return cached_fingerprint_sha256_;
+}
+
 const std::string& SSHKeyGenerator::get_private_key_openssh() const {
     if (cached_private_key_openssh_.empty()) {
         cached_private_key_openssh_ = private_key_to_openssh();
@@ -115,18 +181,36 @@ const std::string& SSHKeyGenerator::get_private_key_openssh() const {
     return cached_private_key_openssh_;
 }
 
-std::string SSHKeyGenerator::public_key_to_ssh() const {
+std::string SSHKeyGenerator::public_key_blob() const {
     std::array<unsigned char, kEd25519KeySize> public_key{};
     if (!get_raw_public_key(public_key)) {
         return "";
     }
-
-    // RFC 4253 wire format: string "ssh-ed25519", string <32 key bytes>
     std::string blob;
     put_string(blob, kEd25519AlgorithmName);
     put_string(blob, public_key);
+    return blob;
+}
 
+std::string SSHKeyGenerator::public_key_to_ssh() const {
+    const std::string blob = public_key_blob();
+    if (blob.empty()) {
+        return "";
+    }
     return std::string(kEd25519AlgorithmName) + ' ' + base64::encode(as_bytes(blob));
+}
+
+// The fingerprint is the SHA-256 of the same blob the public key line encodes
+std::string SSHKeyGenerator::fingerprint_to_sha256() const {
+    const std::string blob = public_key_blob();
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+    unsigned int length = 0;
+    if (blob.empty() ||
+        EVP_Digest(blob.data(), blob.size(), digest.data(), &length, EVP_sha256(), nullptr) != 1) {
+        return "";
+    }
+    return std::string(kFingerprintSha256Prefix) +
+           base64::encode_unpadded(std::span(digest).first(length));
 }
 
 // Serializes the key in OpenSSH's own private key format (PROTOCOL.key in the
@@ -188,66 +272,38 @@ std::string SSHKeyGenerator::private_key_to_openssh() const {
     return result;
 }
 
-bool SSHKeyGenerator::matches_vanity(const VanityPattern& pattern) const {
-    const std::string& ssh_key = get_public_key_ssh();
-    const size_t space_pos = ssh_key.find(' ');
-    if (space_pos == std::string::npos) [[unlikely]] {
-        return false;
-    }
-    const std::string_view key = std::string_view(ssh_key).substr(space_pos + 1);
-
-    const bool case_insensitive = pattern.case_insensitive;
-    const auto equals = [case_insensitive](std::string_view text, std::string_view wanted) {
-        if (!case_insensitive) {
-            return text == wanted;
-        }
-        for (size_t i = 0; i < wanted.size(); ++i) {
-            if (std::tolower(static_cast<unsigned char>(text[i])) != wanted[i]) {
-                return false;
-            }
-        }
-        return true;
-    };
-
-    if (!pattern.prefix.empty()) [[likely]] {
-        // The variable part starts after the constant wire-format prefix
-        if (key.size() < kEd25519WireFormatPrefix.size() + pattern.prefix.size()) [[unlikely]] {
+bool SSHKeyGenerator::matches(const VanityCriteria& criteria) const {
+    // The key is checked first: the fingerprint costs an extra hash, so with a
+    // key pattern it is only computed for the keys that pass
+    if (!criteria.key.empty()) [[likely]] {
+        const std::string_view ssh_key = get_public_key_ssh();
+        if (ssh_key.size() <= kEd25519AlgorithmName.size()) [[unlikely]] {
             return false;
         }
-        if (!equals(
-                key.substr(kEd25519WireFormatPrefix.size(), pattern.prefix.size()), pattern.prefix
+        const std::string_view key = ssh_key.substr(kEd25519AlgorithmName.size() + 1);
+        if (!matches_text(key, kKeyTarget, criteria.key, criteria.case_insensitive)) [[likely]] {
+            return false;
+        }
+    }
+
+    if (!criteria.fingerprint.empty()) {
+        const std::string_view fingerprint = get_fingerprint_sha256();
+        if (fingerprint.size() <= kFingerprintSha256Prefix.size()) [[unlikely]] {
+            return false;
+        }
+        const std::string_view digest = fingerprint.substr(kFingerprintSha256Prefix.size());
+        if (!matches_text(
+                digest, kFingerprintTarget, criteria.fingerprint, criteria.case_insensitive
             )) [[likely]] {
             return false;
         }
-    }
-
-    if (!pattern.suffix.empty()) {
-        if (key.size() < pattern.suffix.size()) [[unlikely]] {
-            return false;
-        }
-        if (!equals(key.substr(key.size() - pattern.suffix.size()), pattern.suffix)) [[likely]] {
-            return false;
-        }
-    }
-
-    if (!pattern.contains.empty()) {
-        if (!case_insensitive) {
-            return key.contains(pattern.contains);
-        }
-        // Reused per thread so the common miss path does not allocate
-        thread_local std::string lowered;
-        lowered.resize(key.size());
-        std::transform(key.begin(), key.end(), lowered.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        return lowered.contains(pattern.contains);
     }
 
     return true;
 }
 
 VanityResult SSHKeyGenerator::generate_vanity_key(
-    const VanityPattern& pattern,
+    const VanityCriteria& criteria,
     int num_threads,
     std::atomic<bool>* stop_flag,
     std::atomic<uint64_t>* total_attempts
@@ -270,21 +326,22 @@ VanityResult SSHKeyGenerator::generate_vanity_key(
     }
 
     // Converted once here rather than in every match
-    const VanityPattern search_pattern = pattern.case_insensitive ? pattern.lowercased() : pattern;
+    const VanityCriteria search_criteria =
+        criteria.case_insensitive ? criteria.lowercased() : criteria;
 
     VanityResult result;
     std::vector<std::thread> threads;
     threads.reserve(static_cast<size_t>(num_threads));
 
     for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back([=, &search_pattern, &found, &result]() {
+        threads.emplace_back([=, &search_criteria, &found, &result]() {
             // Pin each worker to a core to reduce context switching; failure is harmless
             cpu_set_t cpuset;
             CPU_ZERO(&cpuset);
             CPU_SET(static_cast<unsigned int>(i) % std::thread::hardware_concurrency(), &cpuset);
             pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 
-            worker_thread(search_pattern, &found, stop_flag, total_attempts, &result);
+            worker_thread(search_criteria, &found, stop_flag, total_attempts, &result);
         });
     }
 
@@ -297,7 +354,7 @@ VanityResult SSHKeyGenerator::generate_vanity_key(
 }
 
 void SSHKeyGenerator::worker_thread(
-    const VanityPattern& pattern,
+    const VanityCriteria& criteria,
     std::atomic<bool>* found,
     std::atomic<bool>* stop_flag,
     std::atomic<uint64_t>* total_attempts,
@@ -316,12 +373,13 @@ void SSHKeyGenerator::worker_thread(
             }
             ++attempts;
 
-            if (generator.matches_vanity(pattern)) [[unlikely]] {
+            if (generator.matches(criteria)) [[unlikely]] {
                 bool expected = false;
                 if (found->compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
                     // First to find a match: the expensive encodings happen only here
                     result->found = true;
                     result->public_key_ssh = generator.get_public_key_ssh();
+                    result->fingerprint_sha256 = generator.get_fingerprint_sha256();
                     result->private_key_openssh = generator.get_private_key_openssh();
                 }
                 done = true;

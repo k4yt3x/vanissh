@@ -6,6 +6,7 @@
 
 #include <cuda_runtime.h>
 
+#include "matcher.cuh"
 #include "scalarmult.cuh"
 
 // Minimum number of resident blocks per SM the key kernels are compiled for.
@@ -22,12 +23,6 @@ using namespace ed25519;
 constexpr int kBlockSize = 256;
 constexpr int kMinBlocksPerSm = VANISSH_CUDA_MIN_BLOCKS;
 
-constexpr int kKeyChars = 68;    // base64 length of an ssh-ed25519 public key blob
-constexpr int kFixedChars = 25;  // "AAAAC3NzaC1lZDI1NTE5AAAAI" is constant
-constexpr int kMaxPatternLen = kKeyChars;
-constexpr char kBase64Alphabet[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 struct DeviceResult {
     unsigned int found;
     uint32_t seed[8];
@@ -35,77 +30,6 @@ struct DeviceResult {
 };
 
 __constant__ uint32_t c_base_seed[8];
-// Sextet codes of the 24 base64 characters that only depend on the fixed header.
-__constant__ uint8_t c_fixed_sextets[24];
-// Patterns as base64 sextet codes, [kind][variant][i]. Variant 1 holds the
-// alternate-case code for case-insensitive matching (same as variant 0 otherwise).
-__constant__ uint8_t c_pattern[3][2][kMaxPatternLen];
-__constant__ int c_pattern_len[3];
-
-// ---------------------------------------------------------------------------
-// Device code
-// ---------------------------------------------------------------------------
-
-__device__ __forceinline__ bool sextet_matches(uint8_t v, int kind, int i) {
-    return v == c_pattern[kind][0][i] || v == c_pattern[kind][1][i];
-}
-
-// Checks the base64 form of the public key blob against the configured pattern.
-__device__ bool matches_pattern(const uint32_t pk[8]) {
-    // Sextets of the 68-character base64 string. The blob is 51 bytes; the
-    // first 18 are constant and the 19th (0x20, the key length) shares a
-    // base64 group with the first two key bytes.
-    uint8_t sx[kKeyChars];
-#pragma unroll
-    for (int i = 0; i < 24; ++i) {
-        sx[i] = c_fixed_sextets[i];
-    }
-    uint8_t bytes[33];
-    bytes[0] = 0x20;
-#pragma unroll
-    for (int i = 0; i < 32; ++i) {
-        bytes[1 + i] = static_cast<uint8_t>(pk[i >> 2] >> (8 * (i & 3)));
-    }
-#pragma unroll
-    for (int t = 0; t < 11; ++t) {
-        const uint32_t b0 = bytes[3 * t], b1 = bytes[3 * t + 1], b2 = bytes[3 * t + 2];
-        sx[24 + 4 * t] = static_cast<uint8_t>(b0 >> 2);
-        sx[24 + 4 * t + 1] = static_cast<uint8_t>(((b0 & 3) << 4) | (b1 >> 4));
-        sx[24 + 4 * t + 2] = static_cast<uint8_t>(((b1 & 15) << 2) | (b2 >> 6));
-        sx[24 + 4 * t + 3] = static_cast<uint8_t>(b2 & 63);
-    }
-
-    const int prefix_len = c_pattern_len[0];
-    for (int i = 0; i < prefix_len; ++i) {
-        if (!sextet_matches(sx[kFixedChars + i], 0, i)) {
-            return false;
-        }
-    }
-
-    const int suffix_len = c_pattern_len[1];
-    for (int i = 0; i < suffix_len; ++i) {
-        if (!sextet_matches(sx[kKeyChars - suffix_len + i], 1, i)) {
-            return false;
-        }
-    }
-
-    const int contains_len = c_pattern_len[2];
-    if (contains_len > 0) {
-        bool found = false;
-        for (int pos = 0; pos + contains_len <= kKeyChars && !found; ++pos) {
-            bool ok = true;
-            for (int i = 0; i < contains_len && ok; ++i) {
-                ok = sextet_matches(sx[pos + i], 2, i);
-            }
-            found = ok;
-        }
-        if (!found) {
-            return false;
-        }
-    }
-
-    return true;
-}
 
 __global__ void gen_positions_kernel(NielsEntry* bases) {
     if (threadIdx.x < kPositions) {
@@ -174,7 +98,7 @@ __global__ void __launch_bounds__(
                 make_seed(base_counter + static_cast<uint64_t>(k) * nthreads, seed);
             },
             [&](int k, const uint32_t* pk) {
-                if (matches_pattern(pk)) {
+                if (matches_criteria(pk)) {
                     if (atomicCAS(&result->found, 0u, 1u) == 0u) {
                         uint32_t seed[8];
                         make_seed(base_counter + static_cast<uint64_t>(k) * nthreads, seed);
@@ -200,14 +124,6 @@ void check(cudaError_t err, const char* what) {
             std::string("CUDA error (") + what + "): " + cudaGetErrorString(err)
         );
     }
-}
-
-uint8_t base64_index(char c) {
-    const char* pos = std::strchr(kBase64Alphabet, c);
-    if (c == '\0' || pos == nullptr) {
-        throw std::runtime_error(std::string("invalid base64 character '") + c + "'");
-    }
-    return static_cast<uint8_t>(pos - kBase64Alphabet);
 }
 
 }  // namespace
@@ -250,20 +166,6 @@ CudaBackend::CudaBackend(int device) : impl_(std::make_unique<Impl>()) {
     check(cudaDeviceSynchronize(), "table generation");
     cudaFree(d_bases);
 
-    // Sextets of the constant part of the base64 string.
-    const uint8_t header[18] = {
-        0, 0, 0, 11, 's', 's', 'h', '-', 'e', 'd', '2', '5', '5', '1', '9', 0, 0, 0
-    };
-    uint8_t fixed[24];
-    for (int t = 0; t < 6; ++t) {
-        const uint32_t b0 = header[3 * t], b1 = header[3 * t + 1], b2 = header[3 * t + 2];
-        fixed[4 * t] = static_cast<uint8_t>(b0 >> 2);
-        fixed[4 * t + 1] = static_cast<uint8_t>(((b0 & 3) << 4) | (b1 >> 4));
-        fixed[4 * t + 2] = static_cast<uint8_t>(((b1 & 15) << 2) | (b2 >> 6));
-        fixed[4 * t + 3] = static_cast<uint8_t>(b2 & 63);
-    }
-    check(cudaMemcpyToSymbol(c_fixed_sextets, fixed, sizeof(fixed)), "cudaMemcpyToSymbol fixed");
-
     check(cudaMalloc(&impl_->d_result, sizeof(DeviceResult)), "cudaMalloc result");
 
     int blocks_per_sm = 0;
@@ -295,35 +197,9 @@ uint64_t CudaBackend::keys_per_launch(uint32_t batches) const {
     return static_cast<uint64_t>(impl_->grid_blocks) * kBlockSize * kBatch * batches;
 }
 
-void CudaBackend::set_pattern(const VanityPattern& pattern) {
+void CudaBackend::set_criteria(const VanityCriteria& criteria) {
     check(cudaSetDevice(impl_->device), "cudaSetDevice");
-    uint8_t codes[3][2][kMaxPatternLen] = {};
-    int lengths[3] = {};
-    const std::string* parts[3] = {&pattern.prefix, &pattern.suffix, &pattern.contains};
-    for (int kind = 0; kind < 3; ++kind) {
-        const std::string& part = *parts[kind];
-        if (part.size() > static_cast<size_t>(kMaxPatternLen)) {
-            throw std::runtime_error("pattern is longer than the public key");
-        }
-        lengths[kind] = static_cast<int>(part.size());
-        for (size_t i = 0; i < part.size(); ++i) {
-            const char c = part[i];
-            char alt = c;
-            if (pattern.case_insensitive) {
-                if (c >= 'a' && c <= 'z') {
-                    alt = static_cast<char>(c - 'a' + 'A');
-                } else if (c >= 'A' && c <= 'Z') {
-                    alt = static_cast<char>(c - 'A' + 'a');
-                }
-            }
-            codes[kind][0][i] = base64_index(c);
-            codes[kind][1][i] = base64_index(alt);
-        }
-    }
-    check(cudaMemcpyToSymbol(c_pattern, codes, sizeof(codes)), "cudaMemcpyToSymbol pattern");
-    check(
-        cudaMemcpyToSymbol(c_pattern_len, lengths, sizeof(lengths)), "cudaMemcpyToSymbol lengths"
-    );
+    upload_criteria(criteria);
 }
 
 std::vector<Bytes32> CudaBackend::compute_public_keys(const std::vector<Bytes32>& seeds) {

@@ -22,7 +22,7 @@ class CudaVanityGenerator {
     void self_test(size_t count);
 
     VanityResult generate(
-        const VanityPattern& pattern,
+        const VanityCriteria& criteria,
         std::atomic<bool>* stop_flag,
         std::atomic<uint64_t>* total_attempts
     );

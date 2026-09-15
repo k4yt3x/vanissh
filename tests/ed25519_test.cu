@@ -4,12 +4,16 @@
 //   magnitudes each operation is documented to accept, on values around p and
 //   on random inputs; output limbs are also checked against the bounds the
 //   callers rely on.
-// - SHA-512 seed hashing is compared with OpenSSL's SHA-512.
+// - SHA-512 seed hashing and the SHA-256 fingerprint of the public key blob
+//   are compared with OpenSSL.
 // - The fixed-base scalar multiplication is compared with an affine Edwards
 //   implementation on BIGNUM (itself validated against OpenSSL's Ed25519 key
 //   derivation) for scalars that exercise every path of the digit recoding.
 // - The batched seed-to-key derivation used by the search is compared with
 //   OpenSSL for random seeds.
+// - The device pattern matcher is compared with an independent string-based
+//   reference for random criteria over the public key and fingerprint strings
+//   of random and adversarial keys.
 
 #include <array>
 #include <cstdint>
@@ -24,7 +28,9 @@
 #include <openssl/bn.h>
 #include <openssl/evp.h>
 
+#include "cuda/matcher.cuh"
 #include "cuda/scalarmult.cuh"
+#include "reference_matcher.h"
 
 using namespace ed25519;
 
@@ -104,6 +110,22 @@ __global__ void sha_kernel(const uint32_t* seeds, uint32_t* scalars, int count) 
         return;
     }
     sha512_seed_to_scalar(seeds + 8 * i, scalars + 8 * i);
+}
+
+__global__ void sha256_kernel(const uint32_t* pks, uint32_t* digests, int count) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= count) {
+        return;
+    }
+    sha256_pubkey_blob(pks + 8 * i, digests + 8 * i);
+}
+
+__global__ void match_kernel(const uint32_t* pks, uint8_t* out, int count) {
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (i >= count) {
+        return;
+    }
+    out[i] = matches_criteria(pks + 8 * i) ? 1 : 0;
 }
 
 __global__ void gen_positions_kernel(NielsEntry* bases) {
@@ -612,6 +634,113 @@ void test_sha512(std::mt19937_64& rng) {
     std::printf("sha512: %d seeds\n", count);
 }
 
+// SHA-256 of the ssh-ed25519 public key blob of pk, as OpenSSL computes it
+Bytes32 openssl_fingerprint(const Bytes32& pk) {
+    uint8_t blob[51] = {
+        0, 0, 0, 11, 's', 's', 'h', '-', 'e', 'd', '2', '5', '5', '1', '9', 0, 0, 0, 32
+    };
+    std::memcpy(blob + 19, pk.data(), pk.size());
+    Bytes32 digest{};
+    unsigned int length = 0;
+    EVP_Digest(blob, sizeof(blob), digest.data(), &length, EVP_sha256(), nullptr);
+    return digest;
+}
+
+void test_sha256(std::mt19937_64& rng) {
+    const int count = 4096;
+    std::vector<uint32_t> pks(count * 8), digests(count * 8);
+    std::vector<Bytes32> pk_bytes(count);
+    for (int i = 0; i < count; ++i) {
+        pk_bytes[i] = random_bytes(rng);
+        std::memcpy(&pks[i * 8], pk_bytes[i].data(), 32);
+    }
+    uint32_t* d_pks = nullptr;
+    uint32_t* d_digests = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_pks, pks.size() * 4));
+    CUDA_CHECK(cudaMalloc(&d_digests, digests.size() * 4));
+    CUDA_CHECK(cudaMemcpy(d_pks, pks.data(), pks.size() * 4, cudaMemcpyHostToDevice));
+    sha256_kernel<<<(count + 255) / 256, 256>>>(d_pks, d_digests, count);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(digests.data(), d_digests, digests.size() * 4, cudaMemcpyDeviceToHost));
+    cudaFree(d_pks);
+    cudaFree(d_digests);
+
+    for (int i = 0; i < count; ++i) {
+        ++g_checks;
+        const Bytes32 want = openssl_fingerprint(pk_bytes[i]);
+        Bytes32 got{};
+        for (size_t j = 0; j < got.size(); ++j) {
+            // The device returns big-endian words
+            got[j] = static_cast<uint8_t>(digests[i * 8 + j / 4] >> (24 - 8 * (j % 4)));
+        }
+        if (want != got) {
+            fail("sha256 fingerprint mismatch for key " + hex(pk_bytes[i].data(), 32));
+        }
+    }
+    std::printf("sha256: %d keys\n", count);
+}
+
+void test_matcher(std::mt19937_64& rng) {
+    const int count = 1024;
+    const int trials = 400;
+    std::vector<Bytes32> keys(count);
+    for (auto& key : keys) {
+        key = random_bytes(rng);
+    }
+    // Adversarial keys: all bits clear or set, and extreme values in the bytes
+    // that share base64 groups with the constant key length byte
+    keys[0].fill(0);
+    keys[1].fill(0xff);
+    keys[2].fill(0x55);
+    keys[3].fill(0xaa);
+    keys[4][0] = 0;
+    keys[5][0] = 0xff;
+    keys[6][31] = 0xff;
+    keys[7][31] = 0;
+
+    std::vector<std::string> key_strings(count), fingerprints(count);
+    std::vector<uint32_t> pks(count * 8);
+    for (int i = 0; i < count; ++i) {
+        key_strings[i] = reference::key_string(keys[i].data());
+        fingerprints[i] = reference::fingerprint_string(keys[i].data());
+        std::memcpy(&pks[i * 8], keys[i].data(), 32);
+    }
+    uint32_t* d_pks = nullptr;
+    uint8_t* d_out = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_pks, pks.size() * 4));
+    CUDA_CHECK(cudaMalloc(&d_out, count));
+    CUDA_CHECK(cudaMemcpy(d_pks, pks.data(), pks.size() * 4, cudaMemcpyHostToDevice));
+
+    std::vector<uint8_t> out(count);
+    int positives = 0;
+    for (int t = 0; t < trials; ++t) {
+        const int j = static_cast<int>(rng() % count);
+        VanityCriteria criteria = reference::random_criteria(rng, key_strings[j], fingerprints[j]);
+        if (t == 0) {
+            criteria = VanityCriteria{};  // empty criteria match everything
+        }
+        upload_criteria(criteria);
+        match_kernel<<<(count + 255) / 256, 256>>>(d_pks, d_out, count);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaMemcpy(out.data(), d_out, count, cudaMemcpyDeviceToHost));
+        for (int i = 0; i < count; ++i) {
+            ++g_checks;
+            const bool expected = reference::matches(key_strings[i], fingerprints[i], criteria);
+            positives += expected ? 1 : 0;
+            if ((out[i] != 0) != expected) {
+                fail(
+                    std::string("device matcher ") + (expected ? "rejected " : "accepted ") +
+                    reference::describe(criteria) + " for " + key_strings[i] + " / " +
+                    fingerprints[i]
+                );
+            }
+        }
+    }
+    cudaFree(d_pks);
+    cudaFree(d_out);
+    std::printf("matcher: %d criteria x %d keys, %d expected matches\n", trials, count, positives);
+}
+
 // ---------------------------------------------------------------------------
 // Affine Edwards reference and scalar multiplication tests
 // ---------------------------------------------------------------------------
@@ -828,6 +957,8 @@ int main() {
 
     test_field_ops(field, rng);
     test_sha512(rng);
+    test_sha256(rng);
+    test_matcher(rng);
 
     NielsEntry* d_bases = nullptr;
     NielsEntry* d_table = nullptr;

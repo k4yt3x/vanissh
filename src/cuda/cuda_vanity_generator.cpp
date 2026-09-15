@@ -60,13 +60,14 @@ void CudaVanityGenerator::self_test(size_t count) {
 }
 
 VanityResult CudaVanityGenerator::generate(
-    const VanityPattern& pattern,
+    const VanityCriteria& criteria,
     std::atomic<bool>* stop_flag,
     std::atomic<uint64_t>* total_attempts
 ) {
-    backend_.set_pattern(pattern);
-    // matches_vanity expects lower-cased patterns for case-insensitive matching
-    const VanityPattern check_pattern = pattern.case_insensitive ? pattern.lowercased() : pattern;
+    backend_.set_criteria(criteria);
+    // SSHKeyGenerator::matches expects lower-cased patterns for case-insensitive matching
+    const VanityCriteria check_criteria =
+        criteria.case_insensitive ? criteria.lowercased() : criteria;
 
     VanityResult result;
 
@@ -84,13 +85,14 @@ VanityResult CudaVanityGenerator::generate(
             if (!generator.load_from_seed(launch.seed) || !generator.get_raw_public_key(host_key)) {
                 throw std::runtime_error("OpenSSL rejected the seed found by the GPU");
             }
-            if (host_key != launch.public_key || !generator.matches_vanity(check_pattern)) {
+            if (host_key != launch.public_key || !generator.matches(check_criteria)) {
                 throw std::runtime_error(
                     "the key found by the GPU failed host verification; this is a bug"
                 );
             }
             result.found = true;
             result.public_key_ssh = generator.get_public_key_ssh();
+            result.fingerprint_sha256 = generator.get_fingerprint_sha256();
             result.private_key_openssh = generator.get_private_key_openssh();
             break;
         }
