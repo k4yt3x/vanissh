@@ -8,11 +8,15 @@
 // single IMAD.WIDE.U32 per term.
 //
 // Limb-size conventions used to keep everything inside 32/64-bit ranges:
-//   "reduced": limbs < 2^26 (even) / 2^25 (odd) plus a tiny slack. Produced by
-//              mul, sq, sub and add_reduce.
-//   "loose":   limbs < 2^27 / 2^26. Produced by add and neg.
+//   "reduced": limbs < 2^26 (even) / 2^25 (odd), except that limb 0 may carry
+//              up to 114 extra (the folded 19 * carry of sub/add_reduce) and
+//              limb 1 up to 2^17 extra (the folded carry of mul/sq). Produced
+//              by mul, sq, sub and add_reduce.
+//   "loose":   the sum of two reduced values: limbs < 2^27 + 228 (limb 0),
+//              < 2^27 (even), < 2^26 + 2^18 (odd). Produced by add and neg.
 // mul, sq and sub accept reduced or loose inputs; everything they produce is
 // reduced. Only tobytes() needs (and performs) full canonical reduction.
+// tests/ed25519_test.cu checks these bounds and the results against OpenSSL.
 
 #include <cstdint>
 

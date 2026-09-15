@@ -94,4 +94,15 @@ smoke_test = find_program('tests/smoke_test.sh')
 test('smoke test (cpu)', smoke_test, args: [vanissh, '-j', '2'], timeout: 120)
 if have_cuda
   test('smoke test (gpu)', smoke_test, args: [vanissh, '-g'], timeout: 120)
+
+  # Device arithmetic against OpenSSL BIGNUM and Ed25519
+  ed25519_test = executable(
+    'ed25519_test',
+    'tests/ed25519_test.cu',
+    dependencies: [cuda_dep, openssl_dep],
+    cuda_args: cuda_args,
+    link_language: 'cpp',
+    include_directories: 'src',
+  )
+  test('ed25519 unit tests', ed25519_test, timeout: 300)
 endif

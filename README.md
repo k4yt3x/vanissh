@@ -112,7 +112,7 @@ CXX=clang++ meson setup build --reconfigure \
 meson compile -C build
 ```
 
-The compiled binary will be located at `build/vanissh`. `just test` (or `meson test -C build`) runs a smoke test that generates a key with each available backend and checks it with `ssh-keygen`.
+The compiled binary will be located at `build/vanissh`. `just test` (or `meson test -C build`) runs a smoke test that generates a key with each available backend and checks it with `ssh-keygen`, plus, for CUDA builds, unit tests that compare the GPU field arithmetic, SHA-512 and scalar multiplication against OpenSSL on adversarial inputs.
 
 ### CUDA backend
 
