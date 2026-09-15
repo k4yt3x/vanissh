@@ -12,11 +12,9 @@
 #include <pthread.h>
 #include <sched.h>
 
-#include <openssl/bio.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
-#include <openssl/pem.h>
-
-#include <libssh/libssh.h>
+#include <openssl/rand.h>
 
 #include "base64_encoder.h"
 
@@ -24,11 +22,32 @@ namespace {
 
 constexpr std::string_view kEd25519AlgorithmName = "ssh-ed25519";
 constexpr std::string_view kEd25519WireFormatPrefix = "AAAAC3NzaC1lZDI1NTE5AAAAI";
-constexpr size_t kPublicKeyBlobSize = 4 + kEd25519AlgorithmName.size() + 4 + kEd25519KeySize;
 constexpr size_t kPrivateKeyCharsPerLine = 70;
+constexpr std::string_view kOpenSshKeyMagic = "openssh-key-v1";  // followed by a NUL
+constexpr size_t kOpenSshNoneCipherBlockSize = 8;
 
 // Keys generated per thread between updates of the shared counter and flags
 constexpr uint64_t kCheckInterval = 5000;
+
+// RFC 4251 encodings used by the SSH key formats
+void put_uint32(std::string& out, uint32_t value) {
+    const uint32_t big_endian = htonl(value);
+    out.append(reinterpret_cast<const char*>(&big_endian), sizeof(big_endian));
+}
+
+void put_string(std::string& out, std::span<const unsigned char> data) {
+    put_uint32(out, static_cast<uint32_t>(data.size()));
+    out.append(reinterpret_cast<const char*>(data.data()), data.size());
+}
+
+void put_string(std::string& out, std::string_view data) {
+    put_uint32(out, static_cast<uint32_t>(data.size()));
+    out.append(data);
+}
+
+std::span<const unsigned char> as_bytes(std::string_view s) {
+    return {reinterpret_cast<const unsigned char*>(s.data()), s.size()};
+}
 
 }  // namespace
 
@@ -103,89 +122,69 @@ std::string SSHKeyGenerator::public_key_to_ssh() const {
     }
 
     // RFC 4253 wire format: string "ssh-ed25519", string <32 key bytes>
-    std::array<unsigned char, kPublicKeyBlobSize> blob{};
-    size_t offset = 0;
-    const auto append_string = [&](const void* data, size_t size) {
-        const uint32_t length = htonl(static_cast<uint32_t>(size));
-        std::memcpy(blob.data() + offset, &length, sizeof(length));
-        offset += sizeof(length);
-        std::memcpy(blob.data() + offset, data, size);
-        offset += size;
-    };
-    append_string(kEd25519AlgorithmName.data(), kEd25519AlgorithmName.size());
-    append_string(public_key.data(), public_key.size());
+    std::string blob;
+    put_string(blob, kEd25519AlgorithmName);
+    put_string(blob, public_key);
 
-    return std::string(kEd25519AlgorithmName) + ' ' + base64::encode(blob);
+    return std::string(kEd25519AlgorithmName) + ' ' + base64::encode(as_bytes(blob));
 }
 
-std::string SSHKeyGenerator::private_key_to_pem() const {
-    if (private_key_ == nullptr) {
-        return "";
-    }
-
-    BIO* bio = BIO_new(BIO_s_mem());
-    if (bio == nullptr) {
-        return "";
-    }
-
-    std::string pem;
-    if (PEM_write_bio_PrivateKey(bio, private_key_, nullptr, nullptr, 0, nullptr, nullptr) == 1) {
-        char* data = nullptr;
-        const long length = BIO_get_mem_data(bio, &data);
-        pem.assign(data, static_cast<size_t>(length));
-    }
-    BIO_free(bio);
-    return pem;
-}
-
+// Serializes the key in OpenSSH's own private key format (PROTOCOL.key in the
+// OpenSSH sources), unencrypted, as ssh-keygen would write it.
 std::string SSHKeyGenerator::private_key_to_openssh() const {
-    // libssh does the OpenSSH serialization; it is fed the PEM form of the key
-    const std::string pem = private_key_to_pem();
-    if (pem.empty()) {
+    std::array<unsigned char, kEd25519KeySize> seed{};
+    std::array<unsigned char, kEd25519KeySize> public_key{};
+    size_t seed_length = seed.size();
+    if (private_key_ == nullptr ||
+        EVP_PKEY_get_raw_private_key(private_key_, seed.data(), &seed_length) != 1 ||
+        seed_length != seed.size() || !get_raw_public_key(public_key)) {
         return "";
     }
 
-    ssh_key key = nullptr;
-    if (ssh_pki_import_privkey_base64(pem.c_str(), nullptr, nullptr, nullptr, &key) != SSH_OK) {
+    // Both copies of the check value must match for the key to be accepted
+    uint32_t check = 0;
+    if (RAND_bytes(reinterpret_cast<unsigned char*>(&check), sizeof(check)) != 1) {
         return "";
     }
 
-    char* exported = nullptr;
-    const int rc = ssh_pki_export_privkey_base64(key, nullptr, nullptr, nullptr, &exported);
-    ssh_key_free(key);
-    if (rc != SSH_OK || exported == nullptr) {
-        return "";
-    }
-    const std::string_view raw(exported);
+    std::string public_blob;
+    put_string(public_blob, kEd25519AlgorithmName);
+    put_string(public_blob, public_key);
 
-    // Re-wrap the base64 body at 70 columns, the layout ssh-keygen produces
-    constexpr std::string_view header = "-----BEGIN OPENSSH PRIVATE KEY-----";
-    constexpr std::string_view footer = "-----END OPENSSH PRIVATE KEY-----";
-    const size_t header_pos = raw.find(header);
-    const size_t footer_pos = raw.find(footer);
+    // OpenSSH stores the Ed25519 private key as the 64 bytes seed || public key
+    std::array<unsigned char, 2 * kEd25519KeySize> secret{};
+    std::copy(seed.begin(), seed.end(), secret.begin());
+    std::copy(public_key.begin(), public_key.end(), secret.begin() + kEd25519KeySize);
 
-    std::string result;
-    if (header_pos == std::string_view::npos || footer_pos == std::string_view::npos ||
-        footer_pos < header_pos) {
-        result = raw;
-    } else {
-        std::string body;
-        const size_t body_start = header_pos + header.size();
-        for (const char c : raw.substr(body_start, footer_pos - body_start)) {
-            if (!std::isspace(static_cast<unsigned char>(c))) {
-                body += c;
-            }
-        }
-
-        result.reserve(header.size() + footer.size() + body.size() + (body.size() / 32) + 4);
-        result.append(header).append("\n");
-        for (size_t i = 0; i < body.size(); i += kPrivateKeyCharsPerLine) {
-            result.append(body, i, kPrivateKeyCharsPerLine).append("\n");
-        }
-        result.append(footer).append("\n");
+    std::string private_section;
+    put_uint32(private_section, check);
+    put_uint32(private_section, check);
+    put_string(private_section, kEd25519AlgorithmName);
+    put_string(private_section, public_key);
+    put_string(private_section, secret);
+    put_string(private_section, std::string_view());  // comment
+    for (unsigned char pad = 1; private_section.size() % kOpenSshNoneCipherBlockSize != 0; ++pad) {
+        private_section += static_cast<char>(pad);
     }
 
-    ssh_string_free_char(exported);
+    std::string blob(kOpenSshKeyMagic);
+    blob += '\0';
+    put_string(blob, "none");              // cipher
+    put_string(blob, "none");              // kdf
+    put_string(blob, std::string_view());  // kdf options
+    put_uint32(blob, 1);                   // number of keys
+    put_string(blob, public_blob);
+    put_string(blob, private_section);
+
+    OPENSSL_cleanse(seed.data(), seed.size());
+    OPENSSL_cleanse(secret.data(), secret.size());
+
+    const std::string body = base64::encode(as_bytes(blob));
+    std::string result = "-----BEGIN OPENSSH PRIVATE KEY-----\n";
+    for (size_t i = 0; i < body.size(); i += kPrivateKeyCharsPerLine) {
+        result.append(body, i, kPrivateKeyCharsPerLine).append("\n");
+    }
+    result += "-----END OPENSSH PRIVATE KEY-----\n";
     return result;
 }
 

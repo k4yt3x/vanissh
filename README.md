@@ -15,6 +15,10 @@ VaniSSH generates Ed25519 SSH keys whose public key starts with, ends with, or c
 - **Verified results**: every key found on the GPU is re-derived with OpenSSL before it is accepted.
 - **OpenSSH key format** output, written with owner-only permissions and ready for `~/.ssh`.
 
+## Installation
+
+Download the Linux x86-64 binary from [GitHub Releases](https://github.com/k4yt3x/vanissh/releases/latest) and put `vanissh` somewhere on your `PATH`. It runs on any distribution with glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later) and includes the GPU backend, which needs an NVIDIA driver supporting CUDA 13 (R580 or newer) when `-g` is used. Other platforms and older systems can build from source, see [Building](#building).
+
 ## Usage
 
 ```console
@@ -113,14 +117,14 @@ The CPU backend generates keys with OpenSSL on every core and matches their base
 
 - A C++23 compiler (Clang or GCC)
 - Meson 1.1 or later and Ninja
-- OpenSSL and libssh development files
+- OpenSSL development files
 - [just](https://github.com/casey/just) (optional, for the recipes below)
 - CUDA Toolkit 12 or later with `nvcc` on `PATH` (optional, for the GPU backend)
 
 Arch Linux:
 
 ```bash
-sudo pacman -Syu base-devel meson libssh clang ninja just
+sudo pacman -Syu base-devel meson openssl clang ninja just
 sudo pacman -S cuda  # optional, GPU backend
 ```
 
@@ -128,13 +132,13 @@ Debian/Ubuntu:
 
 ```bash
 sudo apt update
-sudo apt install meson ninja-build pkg-config clang libssl-dev libssh-dev just
+sudo apt install meson ninja-build pkg-config clang libssl-dev just
 ```
 
 Red Hat/Fedora:
 
 ```bash
-sudo dnf install meson ninja-build pkgconf clang openssl-devel libssh-devel just
+sudo dnf install meson ninja-build pkgconf clang openssl-devel just
 ```
 
 ### Compile

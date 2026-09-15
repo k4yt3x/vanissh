@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "meson.build"
+      - "meson.options"
+      - ".github/workflows/ci.yaml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "meson.build"
+      - "meson.options"
+      - ".github/workflows/ci.yaml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# CI builds are portable rather than tuned: generic x86-64 for the CPU (measured to be as fast
+# as -march=native, since OpenSSL does its own CPU dispatch) and SASS for every major GPU
+# architecture. Local builds via `just` optimize for the machine they run on.
+
+jobs:
+  cpu:
+    name: Linux, CPU backend
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build pkg-config g++-14 libssl-dev openssh-client
+
+      - name: Configure
+        run: |
+          CXX=g++-14 meson setup build --buildtype=release \
+            -Denable_native=false -Denable_cuda=disabled
+
+      - name: Build
+        run: meson compile -C build
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+  cuda:
+    name: Linux, CUDA backend
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:13.3.1-devel-ubuntu24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            meson ninja-build pkg-config g++-14 libssl-dev openssh-client
+
+      - name: Configure
+        run: |
+          CXX=g++-14 meson setup build --buildtype=release \
+            -Denable_native=false -Denable_cuda=enabled -Dgpu_arch=all-major
+
+      - name: Build
+        run: meson compile -C build
+
+      # The runner has no GPU, so only the CPU backend can be exercised here.
+      - name: Test (CPU backend)
+        run: meson test -C build --print-errorlogs "smoke test (cpu)"

@@ -392,6 +392,10 @@ int main(int argc, char* argv[]) {
         std::println(stderr, "Error: Failed to generate vanity key");
         return 1;
     }
+    if (result.private_key_openssh.empty()) {
+        std::println(stderr, "Error: Failed to serialize the private key");
+        return 1;
+    }
 
     // Display results
     std::println("\nSuccess! Generated vanity SSH key:");

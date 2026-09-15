@@ -26,7 +26,7 @@ test:
     meson test -C '{{bindir}}' --print-errorlogs
 
 format:
-    clang-format -i src/*.cpp src/*.h src/cuda/*.cpp src/cuda/*.h src/cuda/*.cu src/cuda/*.cuh
+    clang-format -i src/*.cpp src/*.h src/cuda/*.cpp src/cuda/*.h src/cuda/*.cu src/cuda/*.cuh tests/*.cu
 
 clean:
     rm -rf '{{bindir}}'

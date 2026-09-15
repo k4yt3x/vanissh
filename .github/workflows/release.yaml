@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            image: nvidia/cuda:13.3.1-devel-ubuntu22.04
+            artifact: vanissh-linux-amd64
+
+    name: Build (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    # Ubuntu 22.04 keeps the glibc requirement at 2.35 (Ubuntu 22.04, Debian 12 and newer). The
+    # C++ runtime is linked statically so the GCC 14 needed for C++23 does not become a runtime
+    # requirement, and the static CUDA runtime only needs the NVIDIA driver when -g is used.
+    container: ${{ matrix.image }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends software-properties-common gpg-agent
+          add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            g++-14 ninja-build pkg-config python3-pip libssl-dev openssh-client
+          python3 -m pip install --no-cache-dir 'meson>=1.1'
+
+      # Meson links libstdc++ explicitly on behalf of the CUDA objects, which would override
+      # -static-libstdc++. -lstdc++ resolves in GCC's own library directory, which Meson lists
+      # first, so removing the shared linker name there makes it pick libstdc++.a instead.
+      - name: Configure
+        run: |
+          rm "$(g++-14 -print-file-name=libstdc++.so)"
+          CXX=g++-14 meson setup build --buildtype=release \
+            -Denable_native=false -Denable_cuda=enabled -Dgpu_arch=all-major \
+            -Dcpp_link_args='-static-libstdc++ -static-libgcc'
+
+      - name: Build
+        run: meson compile -C build
+
+      # The runner has no GPU, so only the CPU backend can be exercised here.
+      - name: Test (CPU backend)
+        run: meson test -C build --print-errorlogs "smoke test (cpu)"
+
+      - name: Package
+        run: |
+          mkdir -p staging
+          cp build/vanissh LICENSE README.md CHANGELOG.md staging/
+          tar -czf ${{ matrix.artifact }}.tar.gz -C staging .
+          sha256sum ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Extract the changelog section for this version
+        run: |
+          set -euo pipefail
+          version="$GITHUB_REF_NAME"
+          # Take the body of "## [<version>]" up to the next "## [" heading, trimming blank lines.
+          # index()==1 is a literal prefix match, so 2.1.0 cannot match 2.1.01.
+          notes="$(
+            awk -v ver="$version" '
+              BEGIN { prefix = "## [" ver "]" }
+              index($0, prefix) == 1 { grab = 1; next }
+              grab && /^## \[/ { exit }
+              grab { print }
+            ' CHANGELOG.md | sed '/./,$!d' | tac | sed '/./,$!d' | tac
+          )"
+          if [ -z "$notes" ]; then
+            echo "::error::No CHANGELOG.md section found for '## [$version]' — add it before tagging."
+            exit 1
+          fi
+          printf '%s\n' "$notes" > release-notes.md
+          echo "--- release notes for $version ---"
+          cat release-notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        with:
+          draft: true
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: |
+            artifacts/*

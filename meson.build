@@ -13,11 +13,10 @@ cuda_opt = get_option('enable_cuda')
 # Find dependencies
 openssl_dep = dependency('openssl', required: true)
 threads_dep = dependency('threads', required: true)
-libssh_dep = dependency('libssh', required: true)
 
 # Source files
 sources = ['src/main.cpp', 'src/base64_encoder.cpp', 'src/ssh_key_generator.cpp']
-deps = [openssl_dep, threads_dep, libssh_dep]
+deps = [openssl_dep, threads_dep]
 link_with = []
 
 # Compiler arguments
@@ -41,20 +40,19 @@ endif
 # Optional CUDA backend
 have_cuda = add_languages('cuda', native: false, required: cuda_opt)
 if have_cuda
-  cuda_dep = dependency('cuda', version: '>=12.0', modules: ['cudart_static'], required: false)
-  if not cuda_dep.found()
-    # Meson only searches CUDA_PATH and /usr/local/cuda; derive the toolkit root from nvcc
-    fs = import('fs')
-    cuda_root = fs.parent(fs.parent(find_program('nvcc').full_path()))
-    cuda_dep = declare_dependency(
-      dependencies: [
-        cpp.find_library('cudart_static', dirs: cuda_root / 'lib64'),
-        cpp.find_library('dl'),
-        cpp.find_library('rt'),
-        threads_dep,
-      ],
-    )
-  endif
+  # The static CUDA runtime is located relative to nvcc rather than through
+  # dependency('cuda'): that only searches CUDA_PATH and /usr/local/cuda, and in
+  # NVIDIA's container images its library probing is misled by LIBRARY_PATH
+  # pointing at the driver stubs.
+  fs = import('fs')
+  cuda_root = fs.parent(fs.parent(find_program('nvcc').full_path()))
+  cudart_static = cpp.find_library(
+    'cudart_static',
+    dirs: [cuda_root / 'lib64', cuda_root / 'targets' / 'x86_64-linux' / 'lib'],
+  )
+  cuda_dep = declare_dependency(
+    dependencies: [cudart_static, cpp.find_library('dl'), cpp.find_library('rt'), threads_dep],
+  )
 
   cuda_args = [
     '-O3',

@@ -43,7 +43,7 @@ class SSHKeyGenerator {
     // Public key as "ssh-ed25519 <base64>"
     [[gnu::hot, nodiscard]] const std::string& get_public_key_ssh() const;
 
-    // Private key in OpenSSH format
+    // Private key in OpenSSH format; empty if the key could not be serialized
     [[nodiscard]] const std::string& get_private_key_openssh() const;
 
     // Check whether the public key matches the pattern. For case-insensitive
@@ -68,7 +68,6 @@ class SSHKeyGenerator {
     void reset_key(EVP_PKEY* key);
 
     std::string public_key_to_ssh() const;
-    std::string private_key_to_pem() const;
     std::string private_key_to_openssh() const;
 
     // Search loop of one thread; the pattern must already be in matcher form
