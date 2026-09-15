@@ -1,91 +1,95 @@
 #include "ssh_key_generator.h"
 
 #include <algorithm>
-#include <cstdlib>
+#include <array>
+#include <cctype>
 #include <cstring>
-#include <sstream>
 #include <string_view>
 #include <thread>
 #include <vector>
 
 #include <arpa/inet.h>
+#include <pthread.h>
 #include <sched.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
-#include <openssl/rand.h>
 
 #include <libssh/libssh.h>
 
 #include "base64_encoder.h"
 
+namespace {
+
 constexpr std::string_view kEd25519AlgorithmName = "ssh-ed25519";
-constexpr size_t kEd25519AlgorithmNameLen = kEd25519AlgorithmName.size();
-
 constexpr std::string_view kEd25519WireFormatPrefix = "AAAAC3NzaC1lZDI1NTE5AAAAI";
-constexpr size_t kEd25519WireFormatPrefixLen = kEd25519WireFormatPrefix.size();
+constexpr size_t kPublicKeyBlobSize = 4 + kEd25519AlgorithmName.size() + 4 + kEd25519KeySize;
+constexpr size_t kPrivateKeyCharsPerLine = 70;
 
-constexpr size_t kEd25519KeySize = 32;
-constexpr size_t kEd25519BufferSize = 256;
-constexpr size_t kSearchBufferSize = 512;
-constexpr size_t kPubkeyCharsPerLine = 70;
+// Keys generated per thread between updates of the shared counter and flags
+constexpr uint64_t kCheckInterval = 5000;
 
-SSHKeyGenerator::SSHKeyGenerator() : private_key_(nullptr), cache_valid_(false) {}
+}  // namespace
 
 SSHKeyGenerator::~SSHKeyGenerator() {
-    if (private_key_) {
-        EVP_PKEY_free(private_key_);
-    }
+    EVP_PKEY_free(private_key_);
+    EVP_PKEY_CTX_free(keygen_ctx_);
+}
+
+void SSHKeyGenerator::reset_key(EVP_PKEY* key) {
+    EVP_PKEY_free(private_key_);
+    private_key_ = key;
+    cached_public_key_ssh_.clear();
+    cached_private_key_openssh_.clear();
 }
 
 bool SSHKeyGenerator::generate_ed25519_key() {
-    clear_cache();
-
-    if (private_key_ != nullptr) [[unlikely]] {
-        EVP_PKEY_free(private_key_);
-        private_key_ = nullptr;
+    // The context is reusable, so it is created once per generator
+    if (keygen_ctx_ == nullptr) [[unlikely]] {
+        keygen_ctx_ = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, nullptr);
+        if (keygen_ctx_ == nullptr || EVP_PKEY_keygen_init(keygen_ctx_) <= 0) {
+            EVP_PKEY_CTX_free(keygen_ctx_);
+            keygen_ctx_ = nullptr;
+            return false;
+        }
     }
 
-    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, nullptr);
-    if (!ctx) {
+    EVP_PKEY* key = nullptr;
+    if (EVP_PKEY_keygen(keygen_ctx_, &key) <= 0) [[unlikely]] {
         return false;
     }
-
-    if (EVP_PKEY_keygen_init(ctx) <= 0) {
-        EVP_PKEY_CTX_free(ctx);
-        return false;
-    }
-
-    EVP_PKEY* pkey = nullptr;
-    if (EVP_PKEY_keygen(ctx, &pkey) <= 0) {
-        EVP_PKEY_CTX_free(ctx);
-        return false;
-    }
-
-    private_key_ = pkey;
-    EVP_PKEY_CTX_free(ctx);
+    reset_key(key);
     return true;
 }
 
+bool SSHKeyGenerator::load_from_seed(std::span<const unsigned char, kEd25519KeySize> seed) {
+    EVP_PKEY* key =
+        EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, nullptr, seed.data(), seed.size());
+    if (key == nullptr) {
+        return false;
+    }
+    reset_key(key);
+    return true;
+}
+
+bool SSHKeyGenerator::get_raw_public_key(std::span<unsigned char, kEd25519KeySize> out) const {
+    if (private_key_ == nullptr) {
+        return false;
+    }
+    size_t length = out.size();
+    return EVP_PKEY_get_raw_public_key(private_key_, out.data(), &length) == 1 &&
+           length == out.size();
+}
+
 const std::string& SSHKeyGenerator::get_public_key_ssh() const {
-    if (!cache_valid_) [[unlikely]] {
+    if (cached_public_key_ssh_.empty()) [[unlikely]] {
         cached_public_key_ssh_ = public_key_to_ssh();
-        cache_valid_ = true;
     }
     return cached_public_key_ssh_;
 }
 
-std::string SSHKeyGenerator::get_private_key_pem() const {
-    if (cached_private_key_pem_.empty()) {
-        cached_private_key_pem_ = private_key_to_pem();
-    }
-    return cached_private_key_pem_;
-}
-
-std::string SSHKeyGenerator::get_private_key_openssh() const {
+const std::string& SSHKeyGenerator::get_private_key_openssh() const {
     if (cached_private_key_openssh_.empty()) {
         cached_private_key_openssh_ = private_key_to_openssh();
     }
@@ -93,268 +97,159 @@ std::string SSHKeyGenerator::get_private_key_openssh() const {
 }
 
 std::string SSHKeyGenerator::public_key_to_ssh() const {
-    if (!private_key_) {
+    std::array<unsigned char, kEd25519KeySize> public_key{};
+    if (!get_raw_public_key(public_key)) {
         return "";
     }
 
-    // Ed25519 SSH format; optimized with pre-allocated buffer
-    unsigned char ssh_key_data[kEd25519BufferSize];  // Stack allocation for speed
+    // RFC 4253 wire format: string "ssh-ed25519", string <32 key bytes>
+    std::array<unsigned char, kPublicKeyBlobSize> blob{};
     size_t offset = 0;
+    const auto append_string = [&](const void* data, size_t size) {
+        const uint32_t length = htonl(static_cast<uint32_t>(size));
+        std::memcpy(blob.data() + offset, &length, sizeof(length));
+        offset += sizeof(length);
+        std::memcpy(blob.data() + offset, data, size);
+        offset += size;
+    };
+    append_string(kEd25519AlgorithmName.data(), kEd25519AlgorithmName.size());
+    append_string(public_key.data(), public_key.size());
 
-    // Algorithm name length (4 bytes big-endian)
-    uint32_t alg_len = htonl(kEd25519AlgorithmNameLen);
-    std::memcpy(ssh_key_data + offset, &alg_len, 4);
-    offset += 4;
-
-    // Algorithm name
-    std::memcpy(ssh_key_data + offset, kEd25519AlgorithmName.data(), kEd25519AlgorithmNameLen);
-    offset += kEd25519AlgorithmNameLen;
-
-    // Public key data
-    size_t pub_len = kEd25519KeySize;
-    unsigned char pub_key[kEd25519KeySize];
-    if (EVP_PKEY_get_raw_public_key(private_key_, pub_key, &pub_len) == 1) {
-        uint32_t key_len = htonl(kEd25519KeySize);
-        std::memcpy(ssh_key_data + offset, &key_len, 4);
-        offset += 4;
-        std::memcpy(ssh_key_data + offset, pub_key, kEd25519KeySize);
-        offset += kEd25519KeySize;
-    }
-
-    return std::string(kEd25519AlgorithmName) + " " +
-           Base64Encoder::encode_data(ssh_key_data, offset);
+    return std::string(kEd25519AlgorithmName) + ' ' + base64::encode(blob);
 }
 
 std::string SSHKeyGenerator::private_key_to_pem() const {
-    if (!private_key_) {
+    if (private_key_ == nullptr) {
         return "";
     }
 
     BIO* bio = BIO_new(BIO_s_mem());
-    if (!bio) {
+    if (bio == nullptr) {
         return "";
     }
 
-    if (PEM_write_bio_PrivateKey(bio, private_key_, nullptr, nullptr, 0, nullptr, nullptr) != 1) {
-        BIO_free(bio);
-        return "";
+    std::string pem;
+    if (PEM_write_bio_PrivateKey(bio, private_key_, nullptr, nullptr, 0, nullptr, nullptr) == 1) {
+        char* data = nullptr;
+        const long length = BIO_get_mem_data(bio, &data);
+        pem.assign(data, static_cast<size_t>(length));
     }
-
-    char* pem_data = nullptr;
-    long pem_len = BIO_get_mem_data(bio, &pem_data);
-
-    std::string result(pem_data, static_cast<size_t>(pem_len));
     BIO_free(bio);
-    return result;
+    return pem;
 }
 
 std::string SSHKeyGenerator::private_key_to_openssh() const {
-    if (!private_key_) {
+    // libssh does the OpenSSH serialization; it is fed the PEM form of the key
+    const std::string pem = private_key_to_pem();
+    if (pem.empty()) {
         return "";
     }
 
-    // Create a libssh key structure
-    ssh_key ssh_key_obj = nullptr;
-
-    // Get PEM format first
-    std::string pem_content = private_key_to_pem();
-    if (pem_content.empty()) {
+    ssh_key key = nullptr;
+    if (ssh_pki_import_privkey_base64(pem.c_str(), nullptr, nullptr, nullptr, &key) != SSH_OK) {
         return "";
     }
 
-    // Import the private key from PEM format
-    int rc =
-        ssh_pki_import_privkey_base64(pem_content.c_str(), nullptr, nullptr, nullptr, &ssh_key_obj);
-    if (rc != SSH_OK) {
+    char* exported = nullptr;
+    const int rc = ssh_pki_export_privkey_base64(key, nullptr, nullptr, nullptr, &exported);
+    ssh_key_free(key);
+    if (rc != SSH_OK || exported == nullptr) {
         return "";
     }
+    const std::string_view raw(exported);
 
-    // Export to OpenSSH format
-    char* openssh_key = nullptr;
-    rc = ssh_pki_export_privkey_base64(ssh_key_obj, nullptr, nullptr, nullptr, &openssh_key);
+    // Re-wrap the base64 body at 70 columns, the layout ssh-keygen produces
+    constexpr std::string_view header = "-----BEGIN OPENSSH PRIVATE KEY-----";
+    constexpr std::string_view footer = "-----END OPENSSH PRIVATE KEY-----";
+    const size_t header_pos = raw.find(header);
+    const size_t footer_pos = raw.find(footer);
 
     std::string result;
-    if (rc == SSH_OK && openssh_key) {
-        std::string raw_key = openssh_key;
-        ssh_string_free_char(openssh_key);
-
-        // Find the header and footer to identify the base64 content
-        const std::string header = "-----BEGIN OPENSSH PRIVATE KEY-----";
-        const std::string footer = "-----END OPENSSH PRIVATE KEY-----";
-
-        size_t header_pos = raw_key.find(header);
-        size_t footer_pos = raw_key.find(footer);
-
-        if (header_pos != std::string::npos && footer_pos != std::string::npos) {
-            // Extract the base64 content between header and footer
-            size_t content_start = header_pos + header.length();
-            while (content_start < footer_pos &&
-                   (raw_key[content_start] == '\n' || raw_key[content_start] == '\r')) {
-                content_start++;
+    if (header_pos == std::string_view::npos || footer_pos == std::string_view::npos ||
+        footer_pos < header_pos) {
+        result = raw;
+    } else {
+        std::string body;
+        const size_t body_start = header_pos + header.size();
+        for (const char c : raw.substr(body_start, footer_pos - body_start)) {
+            if (!std::isspace(static_cast<unsigned char>(c))) {
+                body += c;
             }
-
-            size_t content_end = footer_pos;
-            while (content_end > content_start &&
-                   (raw_key[content_end - 1] == '\n' || raw_key[content_end - 1] == '\r' ||
-                    raw_key[content_end - 1] == ' ')) {
-                content_end--;
-            }
-
-            std::string base64_content = raw_key.substr(content_start, content_end - content_start);
-
-            // Remove any existing whitespace from base64 content
-            base64_content.erase(
-                std::remove_if(
-                    base64_content.begin(),
-                    base64_content.end(),
-                    [](char c) { return std::isspace(c); }
-                ),
-                base64_content.end()
-            );
-
-            // Rebuild the key with proper line wrapping
-            std::ostringstream formatted_key;
-            formatted_key << header << "\n";
-
-            for (size_t i = 0; i < base64_content.length(); i += kPubkeyCharsPerLine) {
-                size_t line_length = std::min(kPubkeyCharsPerLine, base64_content.length() - i);
-                formatted_key << base64_content.substr(i, line_length) << "\n";
-            }
-
-            formatted_key << footer << "\n";
-            result = formatted_key.str();
-        } else {
-            result = raw_key;
         }
+
+        result.reserve(header.size() + footer.size() + body.size() + (body.size() / 32) + 4);
+        result.append(header).append("\n");
+        for (size_t i = 0; i < body.size(); i += kPrivateKeyCharsPerLine) {
+            result.append(body, i, kPrivateKeyCharsPerLine).append("\n");
+        }
+        result.append(footer).append("\n");
     }
 
-    ssh_key_free(ssh_key_obj);
+    ssh_string_free_char(exported);
     return result;
 }
 
-bool SSHKeyGenerator::matches_vanity(
-    const std::string& prefix,
-    const std::string& suffix,
-    const std::string& contains,
-    bool case_insensitive
-) const {
-    // Fast path: generate SSH key string only once and reuse
-    if (!cache_valid_) [[unlikely]] {
-        cached_public_key_ssh_ = public_key_to_ssh();
-        cache_valid_ = true;
-    }
-
-    const std::string& ssh_key = cached_public_key_ssh_;
-    if (ssh_key.empty()) [[unlikely]] {
-        return false;
-    }
-
-    // Extract base64 part and skip algorithm prefix
-    size_t space_pos = ssh_key.find(' ');
+bool SSHKeyGenerator::matches_vanity(const VanityPattern& pattern) const {
+    const std::string& ssh_key = get_public_key_ssh();
+    const size_t space_pos = ssh_key.find(' ');
     if (space_pos == std::string::npos) [[unlikely]] {
         return false;
     }
+    const std::string_view key = std::string_view(ssh_key).substr(space_pos + 1);
 
-    const char* base64_start = ssh_key.c_str() + space_pos + 1;
-    size_t base64_len = ssh_key.length() - space_pos - 1;
-
-    // Check if the prefix matches
-    if (!prefix.empty()) [[likely]] {
-        // Skip the fixed "AAAAC3NzaC1lZDI1NTE5AAAAI" prefix
-        if (base64_len < kEd25519WireFormatPrefixLen + prefix.length()) [[unlikely]] {
-            return false;
+    const bool case_insensitive = pattern.case_insensitive;
+    const auto equals = [case_insensitive](std::string_view text, std::string_view wanted) {
+        if (!case_insensitive) {
+            return text == wanted;
         }
-
-        const char* variable_part = base64_start + kEd25519WireFormatPrefixLen;
-
-        if (case_insensitive) [[unlikely]] {
-            for (size_t i = 0; i < prefix.length(); ++i) {
-                if (std::tolower(variable_part[i]) != prefix[i]) [[unlikely]] {
-                    return false;
-                }
-            }
-        } else {
-            if (std::memcmp(variable_part, prefix.c_str(), prefix.length()) != 0) [[likely]] {
+        for (size_t i = 0; i < wanted.size(); ++i) {
+            if (std::tolower(static_cast<unsigned char>(text[i])) != wanted[i]) {
                 return false;
             }
+        }
+        return true;
+    };
+
+    if (!pattern.prefix.empty()) [[likely]] {
+        // The variable part starts after the constant wire-format prefix
+        if (key.size() < kEd25519WireFormatPrefix.size() + pattern.prefix.size()) [[unlikely]] {
+            return false;
+        }
+        if (!equals(
+                key.substr(kEd25519WireFormatPrefix.size(), pattern.prefix.size()), pattern.prefix
+            )) [[likely]] {
+            return false;
         }
     }
 
-    // Check if the suffix matches
-    if (!suffix.empty()) [[unlikely]] {
-        if (base64_len < suffix.length()) [[unlikely]] {
+    if (!pattern.suffix.empty()) {
+        if (key.size() < pattern.suffix.size()) [[unlikely]] {
             return false;
         }
-
-        const char* suffix_start = base64_start + base64_len - suffix.length();
-
-        if (case_insensitive) [[unlikely]] {
-            for (size_t i = 0; i < suffix.length(); ++i) {
-                if (std::tolower(suffix_start[i]) != suffix[i]) [[unlikely]] {
-                    return false;
-                }
-            }
-        } else {
-            if (std::memcmp(suffix_start, suffix.c_str(), suffix.length()) != 0) [[likely]] {
-                return false;
-            }
+        if (!equals(key.substr(key.size() - pattern.suffix.size()), pattern.suffix)) [[likely]] {
+            return false;
         }
     }
 
-    // Check contains anywhere in the base64 part
-    if (!contains.empty()) [[unlikely]] {
-        if (case_insensitive) {
-            // Use stack buffer for case-insensitive search
-            thread_local static char search_buffer[kSearchBufferSize];
-            if (base64_len < sizeof(search_buffer)) {
-                for (size_t i = 0; i < base64_len; ++i) {
-                    search_buffer[i] = static_cast<char>(std::tolower(base64_start[i]));
-                }
-                search_buffer[base64_len] = '\0';
-
-                // Simple substring search on null-terminated buffer
-                if (!strstr(search_buffer, contains.c_str())) {
-                    return false;
-                }
-            } else {
-                // Base64 part too long for buffer
-                return false;
-            }
-        } else {
-            // Direct memory search for case-sensitive using manual search
-            const char* needle = contains.c_str();
-            size_t needle_len = contains.length();
-            bool found = false;
-
-            for (size_t i = 0; i <= base64_len - needle_len; ++i) {
-                if (memcmp(base64_start + i, needle, needle_len) == 0) {
-                    found = true;
-                    break;
-                }
-            }
-
-            if (!found) {
-                return false;
-            }
+    if (!pattern.contains.empty()) {
+        if (!case_insensitive) {
+            return key.contains(pattern.contains);
         }
+        // Reused per thread so the common miss path does not allocate
+        thread_local std::string lowered;
+        lowered.resize(key.size());
+        std::transform(key.begin(), key.end(), lowered.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return lowered.contains(pattern.contains);
     }
 
     return true;
 }
 
-void SSHKeyGenerator::clear_cache() {
-    cached_public_key_ssh_.clear();
-    cached_private_key_pem_.clear();
-    cached_private_key_openssh_.clear();
-    cache_valid_ = false;
-}
-
 VanityResult SSHKeyGenerator::generate_vanity_key(
-    const std::string& prefix,
-    const std::string& suffix,
-    const std::string& contains,
+    const VanityPattern& pattern,
     int num_threads,
-    bool case_insensitive,
     std::atomic<bool>* stop_flag,
     std::atomic<uint64_t>* total_attempts
 ) {
@@ -368,43 +263,29 @@ VanityResult SSHKeyGenerator::generate_vanity_key(
     std::atomic<bool> found(false);
     std::atomic<bool> local_stop_flag(false);
     std::atomic<uint64_t> local_attempts(0);
-
-    if (!stop_flag) {
+    if (stop_flag == nullptr) {
         stop_flag = &local_stop_flag;
     }
-    if (!total_attempts) {
+    if (total_attempts == nullptr) {
         total_attempts = &local_attempts;
     }
 
-    VanityResult result;
-    result.attempts = 0;
+    // Converted once here rather than in every match
+    const VanityPattern search_pattern = pattern.case_insensitive ? pattern.lowercased() : pattern;
 
+    VanityResult result;
     std::vector<std::thread> threads;
     threads.reserve(static_cast<size_t>(num_threads));
 
     for (int i = 0; i < num_threads; ++i) {
-        threads.emplace_back([=, &found, &result]() {
-            // Set CPU affinity to reduce context switching
+        threads.emplace_back([=, &search_pattern, &found, &result]() {
+            // Pin each worker to a core to reduce context switching; failure is harmless
             cpu_set_t cpuset;
             CPU_ZERO(&cpuset);
-            CPU_SET(
-                static_cast<unsigned int>(
-                    static_cast<unsigned int>(i) % std::thread::hardware_concurrency()
-                ),
-                &cpuset
-            );
-            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+            CPU_SET(static_cast<unsigned int>(i) % std::thread::hardware_concurrency(), &cpuset);
+            pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 
-            worker_thread(
-                prefix,
-                suffix,
-                contains,
-                case_insensitive,
-                &found,
-                stop_flag,
-                total_attempts,
-                &result
-            );
+            worker_thread(search_pattern, &found, stop_flag, total_attempts, &result);
         });
     }
 
@@ -417,71 +298,36 @@ VanityResult SSHKeyGenerator::generate_vanity_key(
 }
 
 void SSHKeyGenerator::worker_thread(
-    const std::string& prefix,
-    const std::string& suffix,
-    const std::string& contains,
-    bool case_insensitive,
+    const VanityPattern& pattern,
     std::atomic<bool>* found,
     std::atomic<bool>* stop_flag,
     std::atomic<uint64_t>* total_attempts,
     VanityResult* result
 ) {
     SSHKeyGenerator generator;
-    uint64_t local_attempts = 0;
+    bool done = false;
 
-    // Pre-convert search patterns to avoid doing it every iteration
-    std::string search_prefix = prefix;
-    std::string search_suffix = suffix;
-    std::string search_contains = contains;
-
-    if (case_insensitive) {
-        std::transform(
-            search_prefix.begin(), search_prefix.end(), search_prefix.begin(), ::tolower
-        );
-        std::transform(
-            search_suffix.begin(), search_suffix.end(), search_suffix.begin(), ::tolower
-        );
-        std::transform(
-            search_contains.begin(), search_contains.end(), search_contains.begin(), ::tolower
-        );
-    }
-
-    // Check found/stop flags less frequently to reduce atomic overhead
-    const uint64_t kCheckInterval = 5000;
-
-    while (true) {
-        // Batch check of atomic flags to reduce overhead
-        if (local_attempts % kCheckInterval == 0) [[unlikely]] {
-            if (found->load(std::memory_order_relaxed) ||
-                stop_flag->load(std::memory_order_relaxed)) [[unlikely]] {
-                break;
+    while (!done && !found->load(std::memory_order_relaxed) &&
+           !stop_flag->load(std::memory_order_relaxed)) {
+        // The shared counter and flags are only touched once per batch
+        uint64_t attempts = 0;
+        for (uint64_t i = 0; i < kCheckInterval && !done; ++i) {
+            if (!generator.generate_ed25519_key()) [[unlikely]] {
+                continue;
             }
-            // Update global counter less frequently to reduce contention
-            total_attempts->fetch_add(kCheckInterval, std::memory_order_relaxed);
-            local_attempts = 0;
-        }
+            ++attempts;
 
-        if (!generator.generate_ed25519_key()) [[unlikely]] {
-            continue;
-        }
-
-        ++local_attempts;
-
-        // Fast path: do direct pattern matching without expensive string operations
-        if (generator.matches_vanity(
-                search_prefix, search_suffix, search_contains, case_insensitive
-            )) [[unlikely]] {
-            bool expected = false;
-            if (found->compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-                // We're the first to find a match; now do expensive operations
-                result->private_key_pem = generator.get_private_key_pem();
-                result->private_key_openssh = generator.get_private_key_openssh();
-                result->public_key_ssh = generator.get_public_key_ssh();
+            if (generator.matches_vanity(pattern)) [[unlikely]] {
+                bool expected = false;
+                if (found->compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+                    // First to find a match: the expensive encodings happen only here
+                    result->found = true;
+                    result->public_key_ssh = generator.get_public_key_ssh();
+                    result->private_key_openssh = generator.get_private_key_openssh();
+                }
+                done = true;
             }
-            break;
         }
+        total_attempts->fetch_add(attempts, std::memory_order_relaxed);
     }
-
-    // Add any remaining attempts
-    total_attempts->fetch_add(local_attempts, std::memory_order_relaxed);
 }

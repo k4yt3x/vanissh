@@ -1,14 +1,11 @@
 #pragma once
 
+#include <span>
 #include <string>
-#include <vector>
 
-class Base64Encoder {
-   public:
-    static std::string encode_data(const std::vector<unsigned char>& data);
-    static std::string encode_data(const unsigned char* data, size_t length);
+namespace base64 {
 
-   private:
-    static constexpr char kEncodingTable[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-};
+// Standard base64 (RFC 4648) with '=' padding
+std::string encode(std::span<const unsigned char> data);
+
+}  // namespace base64

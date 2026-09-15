@@ -1,2 +1,4 @@
 option('enable_native', type: 'boolean', value: true, description: 'Enable native optimizations')
-option('enable_fast_math', type: 'boolean', value: true, description: 'Enable fast math optimizations')
+option('enable_cuda', type: 'feature', value: 'auto', description: 'Build the CUDA GPU backend (requires nvcc)')
+option('gpu_arch', type: 'string', value: 'native', description: 'Value passed to nvcc -arch (e.g. native, sm_86, all-major)')
+option('gpu_window', type: 'integer', min: 4, max: 20, value: 18, description: 'Window size in bits of the GPU fixed-base scalar multiplication table')

@@ -2,38 +2,39 @@
 
 #include <cstdint>
 
-constexpr char Base64Encoder::kEncodingTable[];
+namespace base64 {
 
-std::string Base64Encoder::encode_data(const std::vector<unsigned char>& data) {
-    return encode_data(data.data(), data.size());
+namespace {
+
+constexpr char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+}  // namespace
+
+std::string encode(std::span<const unsigned char> data) {
+    std::string encoded;
+    encoded.reserve(4 * ((data.size() + 2) / 3));
+
+    size_t i = 0;
+    for (; i + 3 <= data.size(); i += 3) {
+        const uint32_t triple = (static_cast<uint32_t>(data[i]) << 16) |
+                                (static_cast<uint32_t>(data[i + 1]) << 8) | data[i + 2];
+        encoded += kAlphabet[(triple >> 18) & 0x3F];
+        encoded += kAlphabet[(triple >> 12) & 0x3F];
+        encoded += kAlphabet[(triple >> 6) & 0x3F];
+        encoded += kAlphabet[triple & 0x3F];
+    }
+
+    const size_t remaining = data.size() - i;
+    if (remaining > 0) {
+        const uint32_t triple = (static_cast<uint32_t>(data[i]) << 16) |
+                                (remaining > 1 ? static_cast<uint32_t>(data[i + 1]) << 8 : 0u);
+        encoded += kAlphabet[(triple >> 18) & 0x3F];
+        encoded += kAlphabet[(triple >> 12) & 0x3F];
+        encoded += remaining > 1 ? kAlphabet[(triple >> 6) & 0x3F] : '=';
+        encoded += '=';
+    }
+
+    return encoded;
 }
 
-std::string Base64Encoder::encode_data(const unsigned char* data, size_t length) {
-    if (length == 0) {
-        return "";
-    }
-
-    size_t output_length = 4 * ((length + 2) / 3);
-    std::string encoded_data;
-    encoded_data.reserve(output_length);
-
-    for (size_t i = 0; i < length; i += 3) {
-        uint32_t octet_a = i < length ? data[i] : 0;
-        uint32_t octet_b = i + 1 < length ? data[i + 1] : 0;
-        uint32_t octet_c = i + 2 < length ? data[i + 2] : 0;
-
-        uint32_t triple = (octet_a << 0x10) + (octet_b << 0x08) + octet_c;
-
-        encoded_data += kEncodingTable[(triple >> 3 * 6) & 0x3F];
-        encoded_data += kEncodingTable[(triple >> 2 * 6) & 0x3F];
-        encoded_data += kEncodingTable[(triple >> 1 * 6) & 0x3F];
-        encoded_data += kEncodingTable[(triple >> 0 * 6) & 0x3F];
-    }
-
-    size_t mod_table[] = {0, 2, 1};
-    for (size_t i = 0; i < mod_table[length % 3]; i++) {
-        encoded_data[encoded_data.length() - 1 - i] = '=';
-    }
-
-    return encoded_data;
-}
+}  // namespace base64

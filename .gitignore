@@ -1,6 +1,10 @@
 # Built binaries
 build/
 
+# Generated keys
+/id_*
+*.pub
+
 # clangd cache
 .cache
 
