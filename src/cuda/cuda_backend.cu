@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include "matcher.cuh"
+#include "number_format.h"
 #include "scalarmult.cuh"
 
 // Minimum number of resident blocks per SM the key kernels are compiled for.
@@ -195,10 +196,10 @@ std::string CudaBackend::device_name() const {
 
 std::string CudaBackend::config_summary() const {
     const size_t table_bytes = kTableEntries * sizeof(NielsEntry);
-    return "window " + std::to_string(kWindow) + " bits, " + std::to_string(kPositions) +
-           " windows/key, table " + std::to_string(table_bytes / (1024 * 1024)) + " MiB, " +
-           std::to_string(impl_->grid_blocks) + "x" + std::to_string(kBlockSize) + " threads x " +
-           std::to_string(kBatch) + " keys/inversion";
+    return "window " + format_number(kWindow) + " bits, " + format_number(kPositions) +
+           " windows/key, table " + format_number(table_bytes / (1024 * 1024)) + " MiB, " +
+           format_number(static_cast<uint64_t>(impl_->grid_blocks)) + "x" +
+           format_number(kBlockSize) + " threads x " + format_number(kBatch) + " keys/inversion";
 }
 
 uint64_t CudaBackend::keys_per_launch(uint32_t batches) const {

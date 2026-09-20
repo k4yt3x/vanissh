@@ -1,7 +1,7 @@
 project(
   'vanissh',
   'cpp',
-  version: '3.0.0',
+  version: '3.0.1',
   meson_version: '>=1.1',
   default_options: ['cpp_std=c++23', 'cuda_std=c++17', 'b_lto=true'],
 )

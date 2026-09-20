@@ -23,6 +23,7 @@
 #include <getopt.h>
 #include <unistd.h>
 
+#include "number_format.h"
 #include "ssh_key_generator.h"
 #include "vanity_pattern.h"
 
@@ -341,10 +342,10 @@ void print_progress() {
 
         std::print(
             "\rAttempts: {} | Rate: {}/s | Avg: {}/s | Elapsed: {}s",
-            current_attempts,
-            attempts_per_second,
-            average_rate,
-            elapsed.count()
+            format_number(current_attempts),
+            format_number(attempts_per_second),
+            format_number(average_rate),
+            format_number(static_cast<uint64_t>(elapsed.count()))
         );
         std::cout.flush();
 
@@ -447,12 +448,16 @@ int main(int argc, char* argv[]) {
             std::println("Backend: CUDA device {} ({})", device.index, device.name);
             std::println("Kernel: {}", device.config);
         }
-        std::println("Self-test: {} keys per GPU verified against OpenSSL", kGpuSelfTestKeys);
+        std::println(
+            "Self-test: {} keys per GPU verified against OpenSSL", format_number(kGpuSelfTestKeys)
+        );
     } else
 #endif
     {
         std::println(
-            "Threads: {}", options.num_threads > 0 ? std::to_string(options.num_threads) : "auto"
+            "Threads: {}",
+            options.num_threads > 0 ? format_number(static_cast<uint64_t>(options.num_threads))
+                                    : "auto"
         );
     }
     if (!options.output_file.empty()) {
@@ -507,11 +512,14 @@ int main(int argc, char* argv[]) {
     // Display results
     std::println("\nSuccess! Generated vanity SSH key:");
     std::println("==================================");
-    std::println("Attempts: {}", result.attempts);
-    std::println("Time: {} ms", elapsed.count());
+    std::println("Attempts: {}", format_number(result.attempts));
+    std::println("Time: {} ms", format_number(static_cast<uint64_t>(elapsed.count())));
     std::println(
         "Rate: {} keys/sec",
-        elapsed.count() > 0 ? result.attempts * 1000 / static_cast<uint64_t>(elapsed.count()) : 0
+        format_number(
+            elapsed.count() > 0 ? result.attempts * 1000 / static_cast<uint64_t>(elapsed.count())
+                                : 0
+        )
     );
     std::println();
 
