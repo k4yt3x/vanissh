@@ -5,11 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/2.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.0.0] - 2026-09-20
+
+### Added
+
+- Multi-GPU search with `-g`/`--gpus` accepting `all` or a list of device indices.
 
 ### Changed
 
+- **Breaking:** `-g` now requires a selector; `-d`/`--device` has been removed.
 - CUDA scalar multiplication folds Ed25519's fixed bits into the precomputed table.
+
+### Fixed
+
+- CUDA startup reports driver errors instead of treating them as missing GPUs.
 
 ## [2.1.0] - 2026-09-15
 

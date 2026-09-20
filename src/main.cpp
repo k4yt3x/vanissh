@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
@@ -16,6 +17,7 @@
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 #include <fcntl.h>
 #include <getopt.h>
@@ -57,7 +59,7 @@ struct Options {
     std::string output_file;
     int num_threads = 0;
     bool use_gpu = false;
-    int gpu_device = 0;
+    std::vector<int> gpu_devices;
 };
 
 // Only async-signal-safe operations are allowed here: write(2), _exit(2) and
@@ -90,9 +92,8 @@ void print_usage() {
         "                                       SHA-256 fingerprint\n"
         "  -j, --threads NUM                  Number of threads to use (default: auto)\n"
 #ifdef VANISSH_CUDA
-        "  -g, --gpu                          Search on the GPU with CUDA instead of the CPU\n"
-        "  -d, --device NUM                   CUDA device index to use; implies --gpu\n"
-        "                                       (default: 0)\n"
+        "  -g, --gpus DEVICES                 CUDA GPUs to use: 'all' or comma-separated\n"
+        "                                       indices (e.g. 0,2); default: CPU\n"
 #endif
         "  -o, --output FILE                  Output private key to file (default: stdout)\n"
         "  -i, --ignore-case                  Case-insensitive matching\n"
@@ -109,7 +110,8 @@ void print_usage() {
         "  vanissh -p abc -i -o id_ed25519\n"
         "  vanissh -S cafe -i\n"
 #ifdef VANISSH_CUDA
-        "  vanissh -g -s TEST -o id_ed25519\n"
+        "  vanissh -g all -s TEST -o id_ed25519\n"
+        "  vanissh -g 0,2 -s TEST\n"
 #endif
     );
 }
@@ -142,8 +144,7 @@ bool parse_options(int argc, char* argv[], Options& options, int& exit_code) {
         {"fingerprint-suffix", required_argument, nullptr, 'S'},
         {"fingerprint-contains", required_argument, nullptr, 'C'},
         {"threads", required_argument, nullptr, 'j'},
-        {"gpu", no_argument, nullptr, 'g'},
-        {"device", required_argument, nullptr, 'd'},
+        {"gpus", required_argument, nullptr, 'g'},
         {"output", required_argument, nullptr, 'o'},
         {"ignore-case", no_argument, nullptr, 'i'},
         {"help", no_argument, nullptr, 'h'},
@@ -152,7 +153,7 @@ bool parse_options(int argc, char* argv[], Options& options, int& exit_code) {
 
     exit_code = 1;
     int c = 0;
-    while ((c = getopt_long(argc, argv, "p:s:c:P:S:C:j:gd:o:ih", long_options, nullptr)) != -1) {
+    while ((c = getopt_long(argc, argv, "p:s:c:P:S:C:j:g:o:ih", long_options, nullptr)) != -1) {
         switch (c) {
             case 'p':
                 options.criteria.key.prefix = optarg;
@@ -181,17 +182,38 @@ bool parse_options(int argc, char* argv[], Options& options, int& exit_code) {
                 options.num_threads = *threads;
                 break;
             }
-            case 'g':
+            case 'g': {
                 options.use_gpu = true;
-                break;
-            case 'd': {
-                const auto device = parse_int(optarg);
-                if (!device || *device < 0) {
-                    std::println(stderr, "Error: Device index must be a non-negative integer");
-                    return false;
+                // Like the pattern options, the last supplied selector wins.
+                options.gpu_devices.clear();
+                std::string_view devices(optarg);
+                if (devices == "all") {
+                    break;
                 }
-                options.gpu_device = *device;
-                options.use_gpu = true;
+                for (;;) {
+                    const size_t comma = devices.find(',');
+                    const auto device = parse_int(devices.substr(0, comma));
+                    if (!device || *device < 0) {
+                        std::println(
+                            stderr,
+                            "Error: GPUs must be 'all' or a comma-separated list of non-negative indices"
+                        );
+                        return false;
+                    }
+                    if (std::find(
+                            options.gpu_devices.begin(), options.gpu_devices.end(), *device
+                        ) != options.gpu_devices.end()) {
+                        std::println(
+                            stderr, "Error: CUDA device {} was selected more than once", *device
+                        );
+                        return false;
+                    }
+                    options.gpu_devices.push_back(*device);
+                    if (comma == std::string_view::npos) {
+                        break;
+                    }
+                    devices.remove_prefix(comma + 1);
+                }
                 break;
             }
             case 'o':
@@ -209,6 +231,10 @@ bool parse_options(int argc, char* argv[], Options& options, int& exit_code) {
         }
     }
 
+    if (optind < argc) {
+        std::println(stderr, "Error: Unexpected argument: {}", argv[optind]);
+        return false;
+    }
     if (options.criteria.empty()) {
         std::println(stderr, "Error: At least one pattern must be specified");
         print_usage();
@@ -382,14 +408,14 @@ int main(int argc, char* argv[]) {
     std::signal(SIGTERM, signal_handler);
 
 #ifdef VANISSH_CUDA
-    // Initialize the GPU backend and verify its key derivation against OpenSSL
+    // Initialize each selected GPU and verify its key derivation against OpenSSL.
     std::unique_ptr<CudaVanityGenerator> gpu;
     if (options.use_gpu) {
         try {
-            gpu = std::make_unique<CudaVanityGenerator>(options.gpu_device);
+            gpu = std::make_unique<CudaVanityGenerator>(options.gpu_devices);
             gpu->self_test(kGpuSelfTestKeys);
         } catch (const std::exception& e) {
-            std::println(stderr, "Error: CUDA device {}: {}", options.gpu_device, e.what());
+            std::println(stderr, "Error: {}", e.what());
             return 1;
         }
     }
@@ -417,9 +443,11 @@ int main(int argc, char* argv[]) {
     }
 #ifdef VANISSH_CUDA
     if (gpu) {
-        std::println("Backend: CUDA device {} ({})", options.gpu_device, gpu->device_name());
-        std::println("Kernel: {}", gpu->config_summary());
-        std::println("Self-test: {} keys verified against OpenSSL", kGpuSelfTestKeys);
+        for (const auto& device : gpu->devices()) {
+            std::println("Backend: CUDA device {} ({})", device.index, device.name);
+            std::println("Kernel: {}", device.config);
+        }
+        std::println("Self-test: {} keys per GPU verified against OpenSSL", kGpuSelfTestKeys);
     } else
 #endif
     {

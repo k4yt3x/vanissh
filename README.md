@@ -12,6 +12,7 @@ VaniSSH generates Ed25519 SSH keys whose public key or SHA-256 fingerprint start
 - **Prefix, suffix and substring matching** on the public key, on its SHA-256 fingerprint, or on both at once, case-sensitive or not.
 - **CPU backend** built on OpenSSL, using every core.
 - **CUDA backend** that runs the whole key derivation on the GPU: about 250 million keys per second on an RTX A6000, roughly 500 times a Ryzen 9 5950X.
+- **Multi-GPU search** uses all visible GPUs or a selected subset, stopping at the first verified match.
 - **Verified results**: every key found on the GPU is re-derived with OpenSSL before it is accepted.
 - **OpenSSH key format** output with owner-only permissions, ready for `~/.ssh`.
 
@@ -37,9 +38,8 @@ Options:
   -C, --fingerprint-contains STRING  String that must appear anywhere in the
                                        SHA-256 fingerprint
   -j, --threads NUM                  Number of threads to use (default: auto)
-  -g, --gpu                          Search on the GPU with CUDA instead of the CPU
-  -d, --device NUM                   CUDA device index to use; implies --gpu
-                                       (default: 0)
+  -g, --gpus DEVICES                 CUDA GPUs to use: 'all' or comma-separated
+                                       indices (e.g. 0,2); default: CPU
   -o, --output FILE                  Output private key to file (default: stdout)
   -i, --ignore-case                  Case-insensitive matching
   -h, --help                         Show this help message
@@ -56,10 +56,21 @@ Examples:
   vanissh -c 1337 -i
   vanissh -p abc -i -o id_ed25519
   vanissh -S cafe -i
-  vanissh -g -s TEST -o id_ed25519
+  vanissh -g all -s TEST -o id_ed25519
+  vanissh -g 0,2 -s TEST
 ```
 
-`-g` and `-d` are only available when VaniSSH was built with CUDA support (see [Building](#building)).
+`-g`/`--gpus` is only available when VaniSSH was built with CUDA support (see [Building](#building)).
+
+The CPU is used unless `-g`/`--gpus` is specified. Use `-g all` for every GPU visible
+to CUDA, `-g 0` for one GPU, or `-g 0,2` for a subset. A selector is required; if
+the option is repeated, the last selector is used. Indices refer to the devices
+visible to the process, including any remapping by `CUDA_VISIBLE_DEVICES`;
+duplicate indices in a list are rejected.
+Each GPU searches independently with fresh random seeds. The first match verified
+by OpenSSL stops the search, and other GPUs finish their current launch before
+exiting. The attempt count and progress rate include all selected GPUs.
+A failure on any selected GPU stops the entire search and reports the device.
 
 ### Examples
 
@@ -69,7 +80,9 @@ vanissh -c cafe -i                # public key contains "cafe" in any case
 vanissh -p abc -i -o id_ed25519   # public key starts with "abc", private key saved to id_ed25519
 vanissh -S cafe -i                # fingerprint ends with "cafe" in any case
 vanissh -P k4y -i -c 1337         # fingerprint starts with "k4y" and the public key contains "1337"
-vanissh -g -s TEST -o id_ed25519  # the first search, on the GPU
+vanissh -g all -s TEST           # search on all visible GPUs
+vanissh -g 0 -s TEST             # search on GPU 0
+vanissh -g 0,2 -s TEST           # search on GPUs 0 and 2
 ```
 
 The private key goes to stdout unless `--output` is given; the file is created with mode 0600 and never overwritten. The public key and its fingerprint are always printed.
@@ -88,7 +101,7 @@ Every character multiplies the expected number of attempts by 64 (32 for a lette
 | Backend | Keys per second |
 | --- | --- |
 | CPU, AMD Ryzen 9 5950X (16 cores / 32 threads, OpenSSL) | ~0.5 million |
-| CUDA, NVIDIA RTX A6000 (`-g`) | ~250 million |
+| CUDA, NVIDIA RTX A6000 (`-g all`) | ~250 million |
 
 Expected search times for a case-sensitive pattern of a given length:
 
@@ -106,7 +119,7 @@ Fingerprint patterns cost about 5% on the GPU and nothing measurable on the CPU.
 ## Security
 
 - **Entropy.** CPU keys come from OpenSSL's key generation. GPU keys are derived from a fresh 256-bit seed drawn from OpenSSL's CSPRNG for every launch, so every candidate is a uniformly random 256-bit value.
-- **Verification.** At startup 4096 GPU-derived keys are compared with OpenSSL, and every key the GPU reports is re-derived and re-matched with OpenSSL before it is written. A GPU bug can only make the search fail, never produce a wrong key.
+- **Verification.** At startup 4096 keys from each selected GPU are compared with OpenSSL, and every key a GPU reports is re-derived and re-matched with OpenSSL before it is written. A GPU bug can only make the search fail, never produce a wrong key.
 - **Key files** are created with mode 0600 and never overwritten.
 
 ## Building

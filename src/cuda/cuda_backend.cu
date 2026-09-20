@@ -132,10 +132,16 @@ struct CudaBackend::Impl {
     int device = 0;
     cudaDeviceProp prop{};
     NielsEntry* d_table = nullptr;
+    NielsEntry* d_bases = nullptr;
     DeviceResult* d_result = nullptr;
     int grid_blocks = 0;
 
     ~Impl() {
+        // Another backend may have changed this host thread's current device.
+        if (cudaSetDevice(device) != cudaSuccess) {
+            return;
+        }
+        cudaFree(d_bases);
         cudaFree(d_table);
         cudaFree(d_result);
     }
@@ -143,9 +149,11 @@ struct CudaBackend::Impl {
 
 int CudaBackend::device_count() {
     int count = 0;
-    if (cudaGetDeviceCount(&count) != cudaSuccess) {
+    const cudaError_t error = cudaGetDeviceCount(&count);
+    if (error == cudaErrorNoDevice) {
         return 0;
     }
+    check(error, "cudaGetDeviceCount");
     return count;
 }
 
@@ -156,15 +164,15 @@ CudaBackend::CudaBackend(int device) : impl_(std::make_unique<Impl>()) {
 
     // Precompute the fixed-base table on the device itself.
     check(cudaMalloc(&impl_->d_table, kTableEntries * sizeof(NielsEntry)), "cudaMalloc table");
-    NielsEntry* d_bases = nullptr;
-    check(cudaMalloc(&d_bases, kPositionBases * sizeof(NielsEntry)), "cudaMalloc bases");
-    gen_positions_kernel<<<1, kPositions>>>(d_bases);
+    check(cudaMalloc(&impl_->d_bases, kPositionBases * sizeof(NielsEntry)), "cudaMalloc bases");
+    gen_positions_kernel<<<1, kPositions>>>(impl_->d_bases);
     check(cudaGetLastError(), "gen_positions_kernel");
     const unsigned int table_blocks = static_cast<unsigned int>((kTableEntries + 255) / 256);
-    gen_table_kernel<<<table_blocks, 256>>>(d_bases, impl_->d_table);
+    gen_table_kernel<<<table_blocks, 256>>>(impl_->d_bases, impl_->d_table);
     check(cudaGetLastError(), "gen_table_kernel");
     check(cudaDeviceSynchronize(), "table generation");
-    cudaFree(d_bases);
+    check(cudaFree(impl_->d_bases), "cudaFree bases");
+    impl_->d_bases = nullptr;
 
     check(cudaMalloc(&impl_->d_result, sizeof(DeviceResult)), "cudaMalloc result");
 

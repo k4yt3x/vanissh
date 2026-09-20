@@ -17,7 +17,9 @@ struct CudaLaunchResult {
 };
 
 // Thin wrapper around the CUDA kernels. Every method throws std::runtime_error
-// on CUDA errors. Must be used from the thread that constructed it.
+// on CUDA errors. Calls select the associated device and must not overlap on
+// the same instance. Use only one active search instance per device: the seed
+// and pattern constants are shared by all kernels on that device.
 class CudaBackend {
    public:
     static int device_count();

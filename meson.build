@@ -1,7 +1,7 @@
 project(
   'vanissh',
   'cpp',
-  version: '2.1.0',
+  version: '3.0.0',
   meson_version: '>=1.1',
   default_options: ['cpp_std=c++23', 'cuda_std=c++17', 'b_lto=true'],
 )
@@ -90,6 +90,8 @@ vanissh = executable(
 # Tests
 smoke_test = find_program('tests/smoke_test.sh')
 test('smoke test (cpu)', smoke_test, args: [vanissh, '-j', '2'], timeout: 120)
+device_options_test = find_program('tests/device_options_test.sh')
+test('device selection options', device_options_test, args: [vanissh], timeout: 30)
 
 # Encodings and the CPU matcher against an independent reference
 matcher_test = executable(
@@ -101,13 +103,28 @@ matcher_test = executable(
 )
 test('matcher unit tests', matcher_test, timeout: 120)
 
+# Link a simulated backend to test multi-GPU coordination without CUDA hardware.
+cuda_generator_test = executable(
+  'cuda_generator_test',
+  [
+    'tests/cuda_vanity_generator_test.cpp',
+    'src/cuda/cuda_vanity_generator.cpp',
+    'src/base64_encoder.cpp',
+    'src/ssh_key_generator.cpp',
+  ],
+  dependencies: [openssl_dep, threads_dep],
+  cpp_args: cpp_args,
+  include_directories: 'src',
+)
+test('multi-GPU coordination', cuda_generator_test, timeout: 30)
+
 # Every combination of target, pattern kind and case mode, end to end; takes
 # minutes, so the default test setup below skips the 'extended' suite
 matrix_test = find_program('tests/matrix_test.sh')
 test('matrix (cpu)', matrix_test, args: [vanissh], timeout: 1800, suite: 'extended')
 if have_cuda
-  test('smoke test (gpu)', smoke_test, args: [vanissh, '-g'], timeout: 120)
-  test('matrix (gpu)', matrix_test, args: [vanissh, '-g'], timeout: 1800, suite: 'extended')
+  test('smoke test (gpu)', smoke_test, args: [vanissh, '-g', 'all'], timeout: 120, suite: 'gpu')
+  test('matrix (gpu)', matrix_test, args: [vanissh, '-g', 'all'], timeout: 1800, suite: ['extended', 'gpu'])
 
   # Device arithmetic against OpenSSL BIGNUM and Ed25519
   ed25519_test = executable(
@@ -118,7 +135,7 @@ if have_cuda
     link_language: 'cpp',
     include_directories: ['src', 'tests'],
   )
-  test('ed25519 unit tests', ed25519_test, timeout: 300)
+  test('ed25519 unit tests', ed25519_test, timeout: 300, suite: 'gpu')
 endif
 
 # `meson test` skips the extended suite; run it with

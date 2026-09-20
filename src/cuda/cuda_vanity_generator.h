@@ -3,21 +3,28 @@
 #include <atomic>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 #include "cuda/cuda_backend.h"
 #include "ssh_key_generator.h"
 #include "vanity_pattern.h"
 
-// GPU vanity key search. The GPU only searches; every candidate it reports is
-// re-derived with OpenSSL on the host before it is accepted.
+struct CudaDeviceInfo {
+    int index;
+    std::string name;
+    std::string config;
+};
+
+// Independent searches on distinct GPUs, stopped by the first verified match.
+// Every candidate is re-derived with OpenSSL on the host before acceptance.
 class CudaVanityGenerator {
    public:
-    explicit CudaVanityGenerator(int device);
+    // An empty selection uses all visible CUDA devices. Duplicates are rejected.
+    explicit CudaVanityGenerator(std::vector<int> devices);
 
-    [[nodiscard]] std::string device_name() const;
-    [[nodiscard]] std::string config_summary() const;
+    [[nodiscard]] const std::vector<CudaDeviceInfo>& devices() const { return devices_; }
 
-    // Derive `count` random seeds on both the GPU and OpenSSL and compare.
+    // Derive `count` random seeds on each GPU and OpenSSL and compare.
     // Throws std::runtime_error on any mismatch.
     void self_test(size_t count);
 
@@ -28,5 +35,6 @@ class CudaVanityGenerator {
     );
 
    private:
-    CudaBackend backend_;
+    std::vector<std::unique_ptr<CudaBackend>> backends_;
+    std::vector<CudaDeviceInfo> devices_;
 };

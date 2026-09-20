@@ -82,6 +82,6 @@ jobs:
       - name: Build
         run: meson compile -C build
 
-      # The runner has no GPU, so only the CPU backend can be exercised here.
-      - name: Test (CPU backend)
-        run: meson test -C build --print-errorlogs "smoke test (cpu)"
+      # Run host-side coordination, CLI and CPU tests without requiring a GPU.
+      - name: Test (without GPU)
+        run: meson test -C build --print-errorlogs --no-suite gpu
