@@ -157,7 +157,7 @@ CudaBackend::CudaBackend(int device) : impl_(std::make_unique<Impl>()) {
     // Precompute the fixed-base table on the device itself.
     check(cudaMalloc(&impl_->d_table, kTableEntries * sizeof(NielsEntry)), "cudaMalloc table");
     NielsEntry* d_bases = nullptr;
-    check(cudaMalloc(&d_bases, kPositions * sizeof(NielsEntry)), "cudaMalloc bases");
+    check(cudaMalloc(&d_bases, kPositionBases * sizeof(NielsEntry)), "cudaMalloc bases");
     gen_positions_kernel<<<1, kPositions>>>(d_bases);
     check(cudaGetLastError(), "gen_positions_kernel");
     const unsigned int table_blocks = static_cast<unsigned int>((kTableEntries + 255) / 256);
@@ -188,7 +188,7 @@ std::string CudaBackend::device_name() const {
 std::string CudaBackend::config_summary() const {
     const size_t table_bytes = kTableEntries * sizeof(NielsEntry);
     return "window " + std::to_string(kWindow) + " bits, " + std::to_string(kPositions) +
-           " point additions/key, table " + std::to_string(table_bytes / (1024 * 1024)) + " MiB, " +
+           " windows/key, table " + std::to_string(table_bytes / (1024 * 1024)) + " MiB, " +
            std::to_string(impl_->grid_blocks) + "x" + std::to_string(kBlockSize) + " threads x " +
            std::to_string(kBatch) + " keys/inversion";
 }

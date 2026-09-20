@@ -6,7 +6,7 @@
 //   callers rely on.
 // - SHA-512 seed hashing and the SHA-256 fingerprint of the public key blob
 //   are compared with OpenSSL.
-// - The fixed-base scalar multiplication is compared with an affine Edwards
+// - The clamped fixed-base scalar multiplication is compared with an affine Edwards
 //   implementation on BIGNUM (itself validated against OpenSSL's Ed25519 key
 //   derivation) for scalars that exercise every path of the digit recoding.
 // - The batched seed-to-key derivation used by the search is compared with
@@ -141,7 +141,7 @@ __global__ void gen_table_kernel(const NielsEntry* __restrict__ bases, NielsEntr
     }
 }
 
-// s * B encoded like a public key, with a plain per-thread inversion
+// Clamped s * B encoded like a public key, with a plain per-thread inversion
 __global__ void scalarmult_kernel(
     const NielsEntry* __restrict__ table,
     const uint32_t* scalars,
@@ -153,7 +153,7 @@ __global__ void scalarmult_kernel(
         return;
     }
     ge_p3 p;
-    scalarmult_base(scalars + 8 * i, table, p);
+    scalarmult_clamped_base(scalars + 8 * i, table, p);
     fe zinv, x, y;
     fe_invert(zinv, p.Z);
     fe_mul(x, p.X, zinv);
@@ -843,7 +843,8 @@ void test_scalarmult(
         1ull << kWindow,
     };
     for (const uint64_t v : small_scalars) {
-        scalars.emplace_back(v);
+        // Boundary digits belong to u in s = 2^254 + 8*u.
+        scalars.emplace_back(v << 3);
     }
     {
         Big v(static_cast<uint64_t>(0));
@@ -854,7 +855,7 @@ void test_scalarmult(
         BN_sub_word(w.get(), 8);
         scalars.push_back(w);  // largest clamped scalar
         BN_add_word(w.get(), 7);
-        scalars.push_back(w);  // 2^255 - 1, the largest scalar accepted
+        scalars.push_back(w);  // exercises clearing the low bits below
     }
     // Every window holding the same digit: the boundary digit kHalf, the first
     // negated digit kHalf + 1 (carry into every position), all ones, and
@@ -865,8 +866,8 @@ void test_scalarmult(
             for (int i = 0; i < kPositions; ++i) {
                 const uint32_t value = (pattern == 0 || (i % 2 == pattern - 1)) ? digit : 0;
                 for (int b = 0; b < kWindow; ++b) {
-                    if (((value >> b) & 1u) != 0 && kWindow * i + b < 255) {
-                        BN_set_bit(v.get(), kWindow * i + b);
+                    if (((value >> b) & 1u) != 0 && 3 + kWindow * i + b < 254) {
+                        BN_set_bit(v.get(), 3 + kWindow * i + b);
                     }
                 }
             }
@@ -886,6 +887,12 @@ void test_scalarmult(
     const int count = static_cast<int>(scalars.size());
     std::vector<uint32_t> h_scalars(count * 8), h_out(count * 8);
     for (int i = 0; i < count; ++i) {
+        // This table specializes in clamped scalars, including the minimum,
+        // maximum and recoding boundaries constructed above.
+        for (int bit : {0, 1, 2, 255}) {
+            BN_clear_bit(scalars[i].get(), bit);
+        }
+        BN_set_bit(scalars[i].get(), 254);
         uint8_t bytes[32] = {};
         BN_bn2lebinpad(scalars[i].get(), bytes, 32);
         std::memcpy(&h_scalars[i * 8], bytes, 32);
@@ -909,7 +916,7 @@ void test_scalarmult(
         if (std::memcmp(want.data(), &h_out[i * 8], 32) != 0) {
             char* hex_scalar = BN_bn2hex(scalars[i].get());
             fail(
-                std::string("scalarmult_base wrong for scalar 0x") + hex_scalar + ": got " +
+                std::string("scalarmult_clamped_base wrong for scalar 0x") + hex_scalar + ": got " +
                 hex(reinterpret_cast<const uint8_t*>(&h_out[i * 8]), 32) + " want " +
                 hex(want.data(), 32)
             );
@@ -962,7 +969,7 @@ int main() {
 
     NielsEntry* d_bases = nullptr;
     NielsEntry* d_table = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_bases, kPositions * sizeof(NielsEntry)));
+    CUDA_CHECK(cudaMalloc(&d_bases, kPositionBases * sizeof(NielsEntry)));
     CUDA_CHECK(cudaMalloc(&d_table, kTableEntries * sizeof(NielsEntry)));
     gen_positions_kernel<<<1, kPositions>>>(d_bases);
     CUDA_CHECK(cudaGetLastError());

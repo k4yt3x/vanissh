@@ -139,7 +139,7 @@ The binary is `build/vanissh`.
 - `-Denable_native=true` (default): compile for the CPU of the build machine.
 - `-Denable_cuda=auto` (default): build the GPU backend when `nvcc` is found; `disabled` skips it, `enabled` requires it.
 - `-Dgpu_arch=native` (default): value passed to `nvcc -arch`; use `all-major` for a portable binary.
-- `-Dgpu_window=18` (default): size of the precomputed GPU table, 4–20 bits. 18 uses 240 MiB of GPU memory, 16 uses 64 MiB and is about 4% slower.
+- `-Dgpu_window=18` (default): size of the precomputed GPU table, 4–20 bits. 18 uses 224 MiB of GPU memory; 16 uses 64 MiB.
 
 ## AI use declaration
 

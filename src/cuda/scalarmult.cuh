@@ -30,9 +30,13 @@ namespace ed25519 {
 
 constexpr int kWindow = VANISSH_CUDA_WINDOW;
 static_assert(kWindow >= 4 && kWindow <= 20, "unsupported window size");
-constexpr int kPositions = (256 + kWindow - 1) / kWindow;
+// A clamped scalar is 2^254 + 8*u, with 0 <= u < 2^251. Recode u
+// instead of the whole scalar, reserving one bit for the signed-digit carry.
+// Fold the fixed 2^254*B point into the last position's table entries.
+constexpr int kPositions = (252 + kWindow - 1) / kWindow;
+constexpr int kPositionBases = kPositions + 1;  // includes the fixed high-bit point
 constexpr uint32_t kHalf = 1u << (kWindow - 1);
-constexpr uint32_t kStride = kHalf + 1;  // identity + 1..kHalf
+constexpr uint32_t kStride = kHalf + 1;  // magnitudes 0..kHalf
 constexpr size_t kTableEntries = static_cast<size_t>(kPositions) * kStride;
 constexpr int kBatch = VANISSH_CUDA_BATCH;
 static_assert(kBatch >= 1 && kBatch <= 256, "unsupported batch size");
@@ -93,19 +97,27 @@ load_niels(const NielsEntry* __restrict__ entry, bool negate, ge_niels& q) {
 // Table generation (wrapped in kernels by the including translation unit)
 // ---------------------------------------------------------------------------
 
-// bases[i] = 2^(W*i) * B in Niels form
+// bases[i] = 2^(3 + W*i) * B; bases[kPositions] = 2^254 * B.
+// The caller launches kPositions threads and allocates kPositionBases entries.
 __device__ inline void generate_position_base(int i, NielsEntry* bases) {
     ge_p3 p;
     ge_base_point(p);
-    for (int k = 0; k < kWindow * i; ++k) {
+    for (int k = 0; k < 3 + kWindow * i; ++k) {
         ge_dbl(p, p);
     }
     ge_niels q;
     ge_to_niels(q, p);
     store_niels(bases + i, q);
+    if (i == kPositions - 1) {
+        for (int bit = 3 + kWindow * i; bit < 254; ++bit) {
+            ge_dbl(p, p);
+        }
+        ge_to_niels(q, p);
+        store_niels(bases + kPositions, q);
+    }
 }
 
-// table[i][j] = j * bases[i] in Niels form, for entry id = i * kStride + j
+// table[i][j] = j * bases[i], plus 2^254*B at the last position.
 __device__ inline void
 generate_table_entry(size_t id, const NielsEntry* __restrict__ bases, NielsEntry* table) {
     const int i = static_cast<int>(id / kStride);
@@ -129,6 +141,14 @@ generate_table_entry(size_t id, const NielsEntry* __restrict__ bases, NielsEntry
         }
         ge_to_niels(q, p);
     }
+    if (i == kPositions - 1) {
+        ge_p3 p;
+        ge_from_niels(p, q);
+        ge_niels offset;
+        load_niels(bases + kPositions, false, offset);
+        ge_nielsadd(p, p, offset);
+        ge_to_niels(q, p);
+    }
     store_niels(table + id, q);
 }
 
@@ -136,20 +156,21 @@ generate_table_entry(size_t id, const NielsEntry* __restrict__ bases, NielsEntry
 // Scalar multiplication and key derivation
 // ---------------------------------------------------------------------------
 
-// Selects s[word] for a warp-uniform, loop-variant index without spilling s
-// to local memory.
+// Selects s[word], with the fixed high bit removed, for a warp-uniform,
+// loop-variant index without spilling s to local memory.
 __device__ __forceinline__ uint32_t scalar_word(const uint32_t s[8], int word) {
     uint32_t v = 0;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        v = (word == i) ? s[i] : v;
+        v = (word == i) ? (i == 7 ? s[i] & 0x3fffffffu : s[i]) : v;
     }
     return v;
 }
 
-// r = s * B for s < 2^255, using signed fixed-window digits and the table.
+// r = s * B for an Ed25519-clamped scalar: low three bits zero, bit 254
+// set, bit 255 clear. Other scalars are not supported by this table.
 __device__ __forceinline__ void
-scalarmult_base(const uint32_t s[8], const NielsEntry* __restrict__ table, ge_p3& r) {
+scalarmult_clamped_base(const uint32_t s[8], const NielsEntry* __restrict__ table, ge_p3& r) {
     // Digits are recoded into [-kHalf + 1, kHalf] so the table only needs
     // positive entries. They are produced on the fly, in order (the recoding
     // carry ripples upwards), straight from the scalar registers: a digit array
@@ -157,7 +178,7 @@ scalarmult_base(const uint32_t s[8], const NielsEntry* __restrict__ table, ge_p3
     // load, which measured 40% slower.
     uint32_t carry = 0;
     const auto digit_at = [&](int i) -> int32_t {
-        const int bit = kWindow * i;
+        const int bit = 3 + kWindow * i;
         const int word = bit >> 5;
         const int shift = bit & 31;
         const uint32_t lo = scalar_word(s, word);
@@ -193,6 +214,8 @@ scalarmult_base(const uint32_t s[8], const NielsEntry* __restrict__ table, ge_p3
         prefetch(entry(i + 1, d_next));
         ge_nielsadd(r, r, q);
     }
+    // The top digit (including carry) is at most kHalf, so it is never
+    // negated: the fixed high-bit point folded into this entry keeps its sign.
     // The last addition does not need the T coordinate.
     load_niels(entry(kPositions - 1, d_next), d_next < 0, q);
     ge_nielsadd<false>(r, r, q);
@@ -213,7 +236,7 @@ derive_public_keys(const NielsEntry* __restrict__ table, SeedFn make_seed, KeyFn
         sha512_seed_to_scalar(seed, s);
 
         ge_p3 p;
-        scalarmult_base(s, table, p);
+        scalarmult_clamped_base(s, table, p);
         fe_copy(xs[k], p.X);
         fe_copy(ys[k], p.Y);
         fe_copy(zs[k], p.Z);
